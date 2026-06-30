@@ -1,9 +1,0 @@
-services:
-  komga:
-    image: ghcr.io/scottdkey/komga:latest
-    container_name: komga
-    restart: unless-stopped
-    ports:
-      - "25600:25600"
-    volumes:
-      - /opt/komga/config:/config
