@@ -1,0 +1,23 @@
+# Komga - Comics, Manga, and Books Server
+# docs: ../../docs/services/komga.md
+
+services:
+  komga:
+    image: gotson/komga:${KOMGA_IMAGE_TAG:-latest}
+    container_name: komga
+    environment:
+      - TZ=${TZ:-America/Denver}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:25600"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "${KOMGA_PORT:-25600}:25600"
+    volumes:
+      - ${KOMGA_CONFIG_PATH:-/opt/appdata/komga}:/config
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/comics:/data/media/comics
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/manga:/data/media/manga
+      - ${MEDIA_PATH:-/mnt/pool/data/media}/books:/data/media/books
+    restart: unless-stopped
