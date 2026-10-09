@@ -8,7 +8,6 @@ use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json;
 
 use crate::api::{Book, ReadList, Series};
-use crate::parse;
 
 /// One readlist slot: a series (name or id) and issue number, or a book id.
 #[orca_struct]
@@ -138,22 +137,33 @@ pub fn find_series<'a>(series: &'a [Series], key: &str) -> SeriesMatch<'a> {
     }
 }
 
-/// Digits with an optional decimal part; `f64` parsing alone would also
-/// accept `nan`, `inf`, and `1e2`.
-fn numeric(s: &str) -> Option<f64> {
+/// Digits with an optional decimal part, as text: leading zeros of the
+/// integer part dropped, fractional digits kept as written so `1.10` and
+/// `1.1` stay distinct issues.
+fn numeric(s: &str) -> Option<String> {
     let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
-    let ok = match s.split_once('.') {
-        Some((int, frac)) => digits(int) && digits(frac),
-        None => digits(s),
+    let (int, frac) = match s.split_once('.') {
+        Some((int, frac)) => (int, Some(frac)),
+        None => (s, None),
     };
-    ok.then(|| s.parse().ok()).flatten()
+    if !digits(int) || !frac.is_none_or(digits) {
+        return None;
+    }
+    let int = match int.trim_start_matches('0') {
+        "" => "0",
+        i => i,
+    };
+    Some(match frac {
+        Some(f) => format!("{int}.{f}"),
+        None => int.to_string(),
+    })
 }
 
-/// `"001"` and `"1.0"` equal `"1"`; non-numeric issues compare as text.
+/// `"001"` equals `"1"`; non-numeric issues compare as text.
 fn same_number(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
     match (numeric(a), numeric(b)) {
-        (Some(x), Some(y)) => parse::canonical(x) == parse::canonical(y),
+        (Some(x), Some(y)) => x == y,
         _ => a.eq_ignore_ascii_case(b),
     }
 }
@@ -256,11 +266,24 @@ fn resolve_one(
                 .flatten()
                 .filter(|b| !b.deleted && same_number(&b.metadata.number, number))
                 .collect();
-            match hits.as_slice() {
-                [] => Err(none(format!("{} has no #{number}", s.name))),
-                [b] if b.available() => Ok(book_ref(&s.name, b)),
-                [b] => Err(none(unavailable(b))),
-                many => Err((
+            let ready: Vec<&Book> = hits.iter().copied().filter(|b| b.available()).collect();
+            match (hits.as_slice(), ready.as_slice()) {
+                ([], _) => Err(none(format!("{} has no #{number}", s.name))),
+                (_, [b]) => Ok(book_ref(&s.name, b)),
+                ([b], []) => Err(none(unavailable(b))),
+                (all, []) => {
+                    let media: Vec<String> =
+                        all.iter().map(|b| b.media_status().to_string()).collect();
+                    Err((
+                        format!(
+                            "no available book is {} #{number} (media {})",
+                            s.name,
+                            media.join(", ")
+                        ),
+                        all.iter().map(|b| book_ref(&s.name, b)).collect(),
+                    ))
+                }
+                (_, many) => Err((
                     format!("ambiguous: {} books are {} #{number}", many.len(), s.name),
                     many.iter().map(|b| book_ref(&s.name, b)).collect(),
                 )),
@@ -429,7 +452,7 @@ mod tests {
 
     #[test]
     fn resolves_in_order_by_name_id_and_book() {
-        let entries = [sn("secret wars (2015)", "001"), sn("B", "1.0")];
+        let entries = [sn("secret wars (2015)", "001"), sn("B", "01")];
         let (ok, bad) = resolve(&entries, &catalog());
         assert!(bad.is_empty(), "{bad:?}");
         let ids: Vec<&str> = ok.iter().map(|r| r.book.book_id.as_str()).collect();
@@ -492,7 +515,10 @@ mod tests {
 
     #[test]
     fn numbers_are_digits_or_exact_text() {
-        assert!(same_number("001", "1.0"));
+        assert!(same_number("001", "1"));
+        assert!(same_number("1.5", "01.5"));
+        assert!(!same_number("1.10", "1.1"));
+        assert!(!same_number("1.0", "1"));
         assert!(same_number("Annual 1", "annual 1"));
         assert!(!same_number("Annual 1", "1"));
         for odd in ["nan", "inf", "1e2", "1.", ".5", "-1"] {
@@ -513,6 +539,38 @@ mod tests {
             "{}",
             bad[1].error
         );
+    }
+
+    #[test]
+    fn unavailable_duplicates_are_dropped_before_counting() {
+        let mut cat = catalog();
+        let broken = |id: &str, n: &str| {
+            let mut b = book(id, "B", n);
+            b.media = Some(Media {
+                status: "ERROR".into(),
+            });
+            b
+        };
+        let b = cat.books.get_mut("B").unwrap();
+        b.push(broken("b1x", "1"));
+        b.push(broken("b2x", "2"));
+        b.push(book("b3", "B", "3"));
+        b.push(book("b3x", "B", "3"));
+        b.push(broken("b3y", "3"));
+        let (ok, bad) = resolve(&[sn("B", "1"), sn("B", "2"), sn("B", "3")], &cat);
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].book.book_id, "b1");
+        assert!(
+            bad[0].error.contains("media ERROR, ERROR"),
+            "{}",
+            bad[0].error
+        );
+        let c: Vec<&str> = bad[1]
+            .candidates
+            .iter()
+            .map(|c| c.book_id.as_str())
+            .collect();
+        assert_eq!(c, ["b3", "b3x"]);
     }
 
     #[test]

@@ -586,6 +586,15 @@ async fn komga_library_scan(args: ScanArgs, ctx: &ToolCtx) -> Result<ScanReport>
 // komga.readlist.sync
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// `--expected-current ""` splits to `[""]`; it means no current books.
+fn non_empty(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
 #[orca_struct(args)]
 pub struct ReadlistSyncArgs {
     /// Registered komga endpoint name.
@@ -660,7 +669,8 @@ async fn komga_readlist_sync(args: ReadlistSyncArgs, ctx: &ToolCtx) -> Result<Re
     if args.readlist.trim().is_empty() {
         bail!("{TOOL}: readlist name is empty");
     }
-    if !args.execute && (!args.book_ids.is_empty() || !args.expected_current.is_empty()) {
+    let expected_current = non_empty(&args.expected_current);
+    if !args.execute && (!args.book_ids.is_empty() || !expected_current.is_empty()) {
         bail!(
             "{TOOL}: `book_ids` and `expected_current` only apply with execute; nothing was written"
         );
@@ -681,7 +691,7 @@ async fn komga_readlist_sync(args: ReadlistSyncArgs, ctx: &ToolCtx) -> Result<Re
             unresolved.len(),
             &Confirmed {
                 book_ids: &args.book_ids,
-                current: &args.expected_current,
+                current: &expected_current,
             },
         )
         .await?
@@ -841,6 +851,8 @@ async fn apply_readlist<O: ReadlistOps>(
             "{TOOL}: execute needs `book_ids` equal to the dry run's, in order; the plan differs"
         );
     }
+    // Komga has no compare-and-swap, so the readlist can still change between
+    // this check and the write below.
     match diff.readlist_id {
         None if !confirmed.current.is_empty() => bail!(
             "{TOOL}: readlist '{name}' no longer exists; re-run the dry run; nothing was written"
@@ -871,6 +883,12 @@ async fn apply_readlist<O: ReadlistOps>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_expected_current_items_are_dropped() {
+        assert!(non_empty(&[String::new()]).is_empty());
+        assert_eq!(non_empty(&["a".into(), " ".into(), "b".into()]), ["a", "b"]);
+    }
+
     use super::*;
 
     #[test]
