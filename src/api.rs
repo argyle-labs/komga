@@ -164,6 +164,12 @@ struct NumberPatch<'a> {
     number_sort_lock: bool,
 }
 
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct EmptyTrashPatch {
+    empty_trash_after_scan: bool,
+}
+
 /// Komga ids are alphanumeric; anything else would reshape the request path.
 pub fn check_id(id: &str) -> Result<&str> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -257,6 +263,24 @@ impl Komga {
             number_sort,
             number_lock: true,
             number_sort_lock: true,
+        };
+        self.send(self.http.patch(self.url(&path)).json(&body), &path)
+            .await
+            .map(drop)
+    }
+
+    /// Delete the book's file from disk through Komga, which drops the book.
+    pub async fn delete_book_file(&self, book_id: &str) -> Result<()> {
+        let path = format!("books/{}/file", check_id(book_id)?);
+        self.send(self.http.delete(self.url(&path)), &path)
+            .await
+            .map(drop)
+    }
+
+    pub async fn enable_empty_trash_after_scan(&self, library_id: &str) -> Result<()> {
+        let path = format!("libraries/{}", check_id(library_id)?);
+        let body = EmptyTrashPatch {
+            empty_trash_after_scan: true,
         };
         self.send(self.http.patch(self.url(&path)).json(&body), &path)
             .await

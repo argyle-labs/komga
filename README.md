@@ -85,6 +85,8 @@ key sent as `X-API-Key`, held in the secrets domain as `komga.<name>.api_key`):
 orca komga.library.audit --name komga                        # read-only: numbering, duplicates, gaps
 orca komga.books.renumber --name komga --all                 # dry run: planned number fixes
 orca komga.books.renumber --name komga --series-id <id> --execute
+orca komga.books.dedupe --name komga --all --purge-generic   # dry run: keep/delete per number
+orca komga.books.dedupe --name komga --all --purge-generic --books <ids> --execute
 orca komga.library.scan --name komga --library-id <id> --deep --execute
 ```
 
@@ -96,6 +98,31 @@ skips locked numbers (unless `--force`), decimal (`605.1`) and suffixed
 look like another series.
 `--execute` applies the whole plan as computed when it runs, with no confirm
 list; each write is a locked metadata change another write can undo.
+
+`dedupe` keeps one file per series and issue number: a full source over
+mobile/webrip, then one with a release tag (`(Digital)` or a scanner group such
+as `Shan-Empire`; Mylar tracks these names) over one without, then `(Digital)`,
+then cbz/cbr over pdf, then the larger. Files are paired only when their series
+parts agree (`The Amazing Spider-Man (2022) Volume 06 Issue 008` pairs with
+`Amazing Spider-Man 008`), and volumes only with volumes. Never paired:
+soft-deleted or unreadable books (reported by `audit` as `unavailable`),
+files that look like another series, and numbers that are a guess — `#10 …
+001`, facsimile editions, annuals filed in a non-annual series, or a number that
+is also in the series name (`Spider-Man 2099`). `TPB`, `HC`, `Omnibus`,
+`Deluxe`, `Compendium`, `Book N` and `vNN` mark collected editions.
+
+`--purge-generic` also deletes every `<Series> (YYYY) Volume NN Issue NNN` file
+and, with `--allow-orphan`, lists as `orphaned` the issues execute would leave
+with no file, for Mylar to re-acquire.
+`--execute` deletes, through Komga's `DELETE /api/v1/books/{id}/file`, the
+`--books` ids from the dry run's `delete_book_ids` that are still in the plan
+when it runs. It does not confirm the rest of the plan is unchanged, so re-run
+the dry run right before executing. A purged file that is an issue's last paired
+copy is marked `last_copy` (a file dedupe does not pair, such as a facsimile,
+is only named in the reason as a possible copy), left out of `delete_book_ids`, and
+dropped by `--execute` unless `--allow-orphan` is passed. `--books` without
+`--execute` is refused. Each library that lost a file then gets
+`emptyTrashAfterScan` (if off) and a scan.
 
 Listings are read in one unpaged request and must match Komga's
 `totalElements` exactly, or the tool fails rather than plan on a partial list.
