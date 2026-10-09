@@ -135,6 +135,7 @@ the filename rules are comic conventions. Any other library needs its id.
 ## Layout
 
 - `src/` — the plugin (pure Rust): the `ServiceBackend` descriptor + the `komga.` library tools.
+- `specs/komga.openapi.json` — Komga's upstream OpenAPI spec (3.1, keys sorted). `build.rs` generates the typed `komga_api` client from the operations listed in `src/operations.rs`. Refresh with `KOMGA_URL=… KOMGA_API_KEY=… scripts/refresh-spec.sh`; `cargo test` fails if a listed operation left the spec.
 - `docs/` — standalone operator notes.
 - [CAPABILITIES.md](CAPABILITIES.md) — the service-backend contract checklist.
 - `assets/` — plugin icon.
