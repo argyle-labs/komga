@@ -1,7 +1,8 @@
 //! Library analysis and the plans built from it: `komga.library.audit`,
-//! `komga.books.renumber`. Pure over fetched Komga records, so every rule is
-//! testable without a server.
+//! `komga.books.renumber`, `komga.books.dedupe`. Pure over fetched Komga
+//! records, so every rule is testable without a server.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use plugin_toolkit::prelude::*;
@@ -621,6 +622,224 @@ pub fn renumber_plan(data: &[LibraryData], force: bool) -> (Vec<Renumber>, Vec<S
     (planned, skipped)
 }
 
+// ── dedupe ─────────────────────────────────────────────────────────────────
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DedupeLoser {
+    pub book_id: String,
+    pub file: String,
+    pub size_bytes: i64,
+    /// Why the kept file wins over this one.
+    pub reason: String,
+    /// Deleting it leaves the issue with no file; execute needs `allow_orphan`.
+    pub last_copy: bool,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DedupeGroup {
+    pub library_id: String,
+    pub series_id: String,
+    pub series_name: String,
+    /// The shared number; `v<N>` for volumes.
+    pub number: String,
+    /// `None` when a generic purge empties the group.
+    pub keep: Option<FileRef>,
+    /// With no `keep`, an available file carrying this number that dedupe
+    /// never pairs (a facsimile, a guessed number). Informational only: it may
+    /// be another issue, so the deletes stay `last_copy`.
+    pub kept_elsewhere: Option<FileRef>,
+    pub delete: Vec<DedupeLoser>,
+}
+
+/// An issue a generic purge leaves with no file, for Mylar to re-acquire.
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrphanIssue {
+    pub series_id: String,
+    /// Series name without its `(YYYY)`.
+    pub series: String,
+    pub year: Option<i32>,
+    pub issue_number: String,
+}
+
+/// Ranking inputs, best first in each field.
+#[derive(Debug, Clone, PartialEq)]
+struct Rank {
+    /// Not a mobile/webrip source.
+    full: bool,
+    /// Carries `(Digital)` or a scanner/group tag; Mylar tracks these names.
+    release: bool,
+    digital: u8,
+    /// cbz/cbr rather than pdf or another container.
+    archive: bool,
+    size: i64,
+}
+
+fn rank(e: &Entry<'_>) -> Rank {
+    Rank {
+        full: !parse::is_mobile(&e.name.tags),
+        release: e.name.tags.iter().any(|t| parse::is_release_tag(t)),
+        digital: parse::digital_tier(&e.name.tags),
+        archive: matches!(e.name.ext.as_str(), "cbz" | "cbr"),
+        size: e.book.size_bytes,
+    }
+}
+
+/// `Less` when `a` should be kept over `b`.
+fn keep_order(a: &Entry<'_>, b: &Entry<'_>) -> Ordering {
+    let (ra, rb) = (rank(a), rank(b));
+    rb.full
+        .cmp(&ra.full)
+        .then(rb.release.cmp(&ra.release))
+        .then(rb.digital.cmp(&ra.digital))
+        .then(rb.archive.cmp(&ra.archive))
+        .then(rb.size.cmp(&ra.size))
+        .then(a.file().cmp(b.file()))
+}
+
+fn loss_reason(keep: &Entry<'_>, lose: &Entry<'_>) -> String {
+    let (k, l) = (rank(keep), rank(lose));
+    if k.full != l.full {
+        "this one is a mobile/webrip source".into()
+    } else if k.release != l.release {
+        "kept file carries a release tag (Mylar tracks it); this one has none".into()
+    } else if k.digital != l.digital {
+        let tier = |t: u8| match t {
+            2 => "(Digital)",
+            1 => "not tagged (Digital)",
+            _ => "mobile/webrip",
+        };
+        format!(
+            "kept file is {}; this one is {}",
+            tier(k.digital),
+            tier(l.digital)
+        )
+    } else if k.archive != l.archive {
+        format!(
+            "kept file is {}; this one is {}",
+            keep.name.ext, lose.name.ext
+        )
+    } else if k.size != l.size {
+        format!("kept file is larger ({} vs {} bytes)", k.size, l.size)
+    } else {
+        "identical rank; kept the first by name".into()
+    }
+}
+
+/// Duplicate numbers collapse to the best-ranked copy. With `purge_generic`,
+/// every generic-named issue file is deleted too, twin or not; volumes are
+/// never purged.
+pub fn dedupe_plan(data: &[LibraryData], purge_generic: bool) -> Vec<DedupeGroup> {
+    let mut out = Vec::new();
+    for lib in data {
+        for v in views(lib) {
+            let series_key = parse::comic_key(&v.series.name);
+            let first = out.len();
+            for (kind, number, es) in v.clusters() {
+                let purge = purge_generic && kind == Kind::Issue;
+                // A generic rename of another comic would be listed as this
+                // series' orphan, so only this series' own renames are purged.
+                let (generic, mut rest): (Vec<&Entry<'_>>, Vec<&Entry<'_>>) =
+                    es.into_iter().partition(|e| {
+                        purge
+                            && parse::is_generic(e.file())
+                            && parse::same_comic(&e.comic_key(), &series_key)
+                    });
+                rest.sort_by(|a, b| keep_order(a, b));
+                let keep = rest.first().copied();
+                let mut delete: Vec<DedupeLoser> = generic
+                    .iter()
+                    .map(|e| loser(e, "generic name (no release tag); purged".into()))
+                    .collect();
+                if let Some(k) = keep {
+                    delete.extend(rest[1..].iter().map(|e| loser(e, loss_reason(k, e))));
+                }
+                if delete.is_empty() {
+                    continue;
+                }
+                out.push(DedupeGroup {
+                    library_id: lib.library.id.clone(),
+                    series_id: v.series.id.clone(),
+                    series_name: v.series.name.clone(),
+                    number,
+                    keep: keep.map(Entry::file_ref),
+                    kept_elsewhere: None,
+                    delete,
+                });
+            }
+            mark_last_copies(&v, &series_key, &mut out[first..]);
+        }
+    }
+    out
+}
+
+/// A group with no `keep` loses its last paired copy. A file clustering left
+/// out (a guessed number) is noted as a possible copy but never trusted.
+fn mark_last_copies(v: &SeriesView<'_>, series_key: &parse::ComicKey, groups: &mut [DedupeGroup]) {
+    let deleted: BTreeSet<String> = groups
+        .iter()
+        .flat_map(|g| &g.delete)
+        .map(|l| l.book_id.clone())
+        .collect();
+    for g in groups.iter_mut().filter(|g| g.keep.is_none()) {
+        let mut note = String::new();
+        g.kept_elsewhere = v
+            .entries
+            .iter()
+            .find(|e| {
+                !deleted.contains(&e.book.id)
+                    && e.misfiled.is_none()
+                    && parse::same_comic(&e.comic_key(), series_key)
+                    && e.name.parsed.as_ref().is_some_and(|p| {
+                        p.kind == Kind::Issue && p.label.to_lowercase() == g.number
+                    })
+            })
+            .map(|e| {
+                let edge = e.name.parsed.as_ref().and_then(|p| p.edge);
+                note = edge.map_or_else(
+                    || format!("; possible copy: {}", e.file()),
+                    |k| format!("; possible copy: {} ({})", e.file(), k.as_str()),
+                );
+                e.file_ref()
+            });
+        for l in &mut g.delete {
+            l.last_copy = true;
+            l.reason.push_str("; last copy of this issue");
+            l.reason.push_str(&note);
+        }
+    }
+}
+
+fn loser(e: &Entry<'_>, reason: String) -> DedupeLoser {
+    DedupeLoser {
+        book_id: e.book.id.clone(),
+        file: e.file().to_string(),
+        size_bytes: e.book.size_bytes,
+        reason,
+        last_copy: false,
+    }
+}
+
+/// Issues execute would leave with no file: none without `allow_orphan`,
+/// since last copies are then dropped.
+pub fn orphans(groups: &[DedupeGroup], allow_orphan: bool) -> Vec<OrphanIssue> {
+    groups
+        .iter()
+        .filter(|g| allow_orphan && g.keep.is_none())
+        .map(|g| {
+            let (series, year) = parse::split_year(&g.series_name);
+            OrphanIssue {
+                series_id: g.series_id.clone(),
+                series,
+                year,
+                issue_number: g.number.clone(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +948,421 @@ mod tests {
         assert!(planned.is_empty() && skipped.is_empty());
     }
 
+    /// `dedupe_plan` plus the invariant every fixture must hold: without a
+    /// purge, each group keeps a file and never deletes it.
+    fn plan(data: &[LibraryData], purge: bool) -> Vec<DedupeGroup> {
+        let groups = dedupe_plan(data, purge);
+        let mut deleted = BTreeSet::new();
+        for g in &groups {
+            for l in &g.delete {
+                assert_eq!(l.last_copy, g.keep.is_none(), "{g:?}");
+                assert!(deleted.insert(l.book_id.clone()), "deleted twice: {l:?}");
+                if let Some(k) = &g.keep {
+                    assert_ne!(l.book_id, k.book_id, "keep deleted: {g:?}");
+                }
+            }
+        }
+        if !purge {
+            for g in &groups {
+                let keep = g.keep.as_ref().unwrap_or_else(|| panic!("no keep: {g:?}"));
+                assert!(
+                    g.delete.iter().all(|l| l.book_id != keep.book_id),
+                    "keep deleted: {g:?}"
+                );
+                assert!(g.delete.iter().all(|l| !l.last_copy), "{g:?}");
+            }
+        }
+        groups
+    }
+
+    fn dedupe(series_name: &str, books: Vec<Book>) -> Vec<DedupeGroup> {
+        plan(&[lib(&[("S1", series_name)], books)], false)
+    }
+
+    #[test]
+    fn release_named_beats_generic_even_when_smaller() {
+        let g = dedupe(
+            "The Amazing Spider-Man (2025)",
+            vec![
+                book(
+                    "gen",
+                    "S1",
+                    "The Amazing Spider-Man (2025) Volume 01 Issue 008.cbz",
+                    1.0,
+                    900,
+                ),
+                book(
+                    "rel",
+                    "S1",
+                    "Amazing Spider-Man 008 (2025) (Digital) (Shan-Empire).cbz",
+                    2.0,
+                    100,
+                ),
+            ],
+        );
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].number, "8");
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "rel");
+        assert_eq!(g[0].delete[0].book_id, "gen");
+        assert!(g[0].delete[0].reason.contains("release tag"));
+    }
+
+    #[test]
+    fn digital_beats_other_release_tags_then_size() {
+        let g = dedupe(
+            "All Star Superman (2006)",
+            vec![
+                book(
+                    "emp",
+                    "S1",
+                    "All Star Superman 07 (2007) (Empire-Megan).cbr",
+                    1.0,
+                    900,
+                ),
+                book(
+                    "dig",
+                    "S1",
+                    "All Star Superman 007 (2007) (digital) (Minutemen-PhD).cbr",
+                    2.0,
+                    100,
+                ),
+            ],
+        );
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "dig");
+        assert!(g[0].delete[0].reason.contains("(Digital)"));
+
+        let g = dedupe(
+            "Invincible (2003)",
+            vec![
+                book(
+                    "small",
+                    "S1",
+                    "Invincible 073 (2010) (digital-Empire).cbz",
+                    1.0,
+                    100,
+                ),
+                book(
+                    "big",
+                    "S1",
+                    "Invincible 073 (2010) (digital) (Minutemen-InnerDemons).cbr",
+                    2.0,
+                    200,
+                ),
+            ],
+        );
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "big");
+        assert!(g[0].delete[0].reason.contains("larger"));
+    }
+
+    #[test]
+    fn digital_beats_mobile() {
+        let g = dedupe(
+            "Saga (2012)",
+            vec![
+                book(
+                    "mob",
+                    "S1",
+                    "Saga 001 (2012) (digital-mobile) (Empire).cbz",
+                    1.0,
+                    900,
+                ),
+                book(
+                    "dig",
+                    "S1",
+                    "Saga 001 (2012) (Digital) (Empire).cbz",
+                    2.0,
+                    100,
+                ),
+            ],
+        );
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "dig");
+        assert!(g[0].delete[0].reason.contains("mobile/webrip"));
+    }
+
+    #[test]
+    fn archive_beats_pdf_for_the_same_volume() {
+        let g = dedupe(
+            "Green Lantern Earth One (2018)",
+            vec![
+                book(
+                    "pdf1",
+                    "S1",
+                    "bb-green.lantern.earth.one.volume.1.pdf",
+                    1.0,
+                    900,
+                ),
+                book(
+                    "pdf2",
+                    "S1",
+                    "bb-green.lantern.earth.one.volume.2.pdf",
+                    2.0,
+                    900,
+                ),
+                book(
+                    "cbr1",
+                    "S1",
+                    "Green Lantern - Earth One  v01 (2018) (digital) (Son of Ultron-Empire).cbr",
+                    3.0,
+                    100,
+                ),
+                book(
+                    "cbr2",
+                    "S1",
+                    "Green Lantern - Earth One v02 (2020) (digital) (Son of Ultron-Empire).cbr",
+                    4.0,
+                    100,
+                ),
+            ],
+        );
+        let pairs: Vec<(&str, &str, &str)> = g
+            .iter()
+            .map(|d| {
+                (
+                    d.number.as_str(),
+                    d.keep.as_ref().unwrap().book_id.as_str(),
+                    d.delete[0].book_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(pairs, vec![("v1", "cbr1", "pdf1"), ("v2", "cbr2", "pdf2")]);
+
+        let g = dedupe(
+            "A (2010)",
+            vec![
+                book("cbz", "S1", "A 001 (2010) (Digital).cbz", 1.0, 1),
+                book("pdf", "S1", "A 001 (2010) (Digital).pdf", 2.0, 9),
+            ],
+        );
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "cbz");
+        assert!(g[0].delete[0].reason.contains("cbz"));
+    }
+
+    #[test]
+    fn deleted_or_unready_books_never_keep_or_lose() {
+        let mut gone = book(
+            "cbr1",
+            "S1",
+            "Green Lantern - Earth One  v01 (2018) (digital) (Son of Ultron-Empire).cbr",
+            1.0,
+            200,
+        );
+        gone.deleted = true;
+        let mut broken = book(
+            "err",
+            "S1",
+            "Saga 001 (2012) (Digital) (Zone-Empire).cbr",
+            3.0,
+            1,
+        );
+        broken.media = Some(crate::api::Media {
+            status: "ERROR".into(),
+        });
+        let data = lib(
+            &[("S1", "Green Lantern Earth One (2018)")],
+            vec![
+                gone,
+                book(
+                    "pdf1",
+                    "S1",
+                    "bb-green.lantern.earth.one.volume.1.pdf",
+                    2.0,
+                    100,
+                ),
+                broken,
+                book("ok", "S1", "Saga 001 (2012).cbr", 4.0, 1),
+            ],
+        );
+        assert!(plan(std::slice::from_ref(&data), true).is_empty());
+        let (planned, _) = renumber_plan(std::slice::from_ref(&data), false);
+        assert!(planned
+            .iter()
+            .all(|r| r.book_id != "cbr1" && r.book_id != "err"));
+        let r = audit("k", &[data]);
+        assert_eq!(r.summary.unavailable_books, 2);
+        let un = &r.libraries[0].series[0].unavailable;
+        assert_eq!(
+            (un[0].deleted, un[1].media_status.as_str()),
+            (true, "ERROR")
+        );
+    }
+
+    #[test]
+    fn misfiled_and_guessed_numbers_never_pair() {
+        let g = dedupe(
+            "Secret Wars (2015)",
+            vec![
+                book(
+                    "a",
+                    "S1",
+                    "Secret Wars 001 (2015) (Digital) (Zone-Empire).cbr",
+                    1.0,
+                    1,
+                ),
+                book(
+                    "b",
+                    "S1",
+                    "Batman 001 (2016) (Digital) (Zone-Empire).cbr",
+                    2.0,
+                    1,
+                ),
+                book(
+                    "c",
+                    "S1",
+                    "Secret Wars Journal 001 (2015) (Digital) (Zone-Empire).cbr",
+                    3.0,
+                    1,
+                ),
+            ],
+        );
+        assert!(g.is_empty(), "{g:?}");
+
+        let g = dedupe(
+            "Marvel Super Heroes Secret Wars (1984)",
+            vec![
+                book("gen", "S1", "Marvel Super Heroes Secret Wars (1984) Volume 01 Issue 010.cbz", 1.0, 1),
+                book("fax", "S1", "Marvel Super Heroes Secret Wars #10 Facsimile Edition 001 (1985) (c2c) (digital) (Marika-Empire).cbz", 2.0, 1),
+            ],
+        );
+        assert!(g.is_empty(), "{g:?}");
+    }
+
+    #[test]
+    fn series_name_numbers_are_not_issue_numbers() {
+        let data = lib(
+            &[("S1", "Spider-Man 2099 (2014)")],
+            vec![
+                book(
+                    "a",
+                    "S1",
+                    "Spider-Man 2099 (2014) (Digital) (Zone-Empire).cbr",
+                    1.0,
+                    1,
+                ),
+                book(
+                    "b",
+                    "S1",
+                    "Spider-Man 2099 (2014) (Digital) (Minutemen-X).cbr",
+                    2.0,
+                    1,
+                ),
+                book("c", "S1", "Spider-Man 2099 003 (2014).cbr", 2.0, 1),
+            ],
+        );
+        assert!(plan(std::slice::from_ref(&data), false).is_empty());
+        let (planned, skipped) = renumber_plan(std::slice::from_ref(&data), false);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].book_id, "c");
+        assert!(skipped
+            .iter()
+            .any(|s| s.book_id == "a" && s.reason.contains("series name")));
+    }
+
+    #[test]
+    fn tpb_annual_and_of_n_are_kept_apart() {
+        let data = lib(
+            &[("S1", "Invincible (2003)")],
+            vec![
+                book(
+                    "i1",
+                    "S1",
+                    "Invincible 001 (2003) (Digital) (Zone-Empire).cbr",
+                    1.0,
+                    1,
+                ),
+                book(
+                    "tpb",
+                    "S1",
+                    "Invincible TPB 1 (2003) (Digital) (Zone-Empire).cbr",
+                    2.0,
+                    1,
+                ),
+                book(
+                    "ann",
+                    "S1",
+                    "Invincible Annual 01 (2011) (Digital) (Zone-Empire).cbr",
+                    3.0,
+                    1,
+                ),
+                book("i2", "S1", "Invincible 02 (of 04) (2003).cbr", 4.0, 1),
+                book(
+                    "i2b",
+                    "S1",
+                    "Invincible 002 (2003) (Digital) (Zone-Empire).cbr",
+                    5.0,
+                    1,
+                ),
+            ],
+        );
+        let g = plan(std::slice::from_ref(&data), false);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(g[0].number, "2");
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "i2b");
+        let r = audit("k", &[data]);
+        let kinds: Vec<&str> = r.libraries[0].series[0]
+            .edge_cases
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["collected_edition", "annual"]);
+    }
+
+    #[test]
+    fn mobile_release_loses_to_untagged() {
+        let g = dedupe(
+            "Saga (2012)",
+            vec![
+                book(
+                    "mob",
+                    "S1",
+                    "Saga 001 (2012) (digital-mobile) (Empire-Megan).cbz",
+                    1.0,
+                    900,
+                ),
+                book("plain", "S1", "Saga 001 (2012).cbz", 2.0, 100),
+            ],
+        );
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "plain");
+        assert!(g[0].delete[0].reason.contains("mobile"));
+    }
+
+    #[test]
+    fn loose_tags_do_not_make_a_release() {
+        let g = dedupe(
+            "Saga (2012)",
+            vec![
+                book(
+                    "var",
+                    "S1",
+                    "Saga 001 (2012) (Variant) (c2c) (F).cbz",
+                    1.0,
+                    900,
+                ),
+                book(
+                    "rel",
+                    "S1",
+                    "Saga 001 (2012) (Digital) (Zone-Empire).cbz",
+                    2.0,
+                    100,
+                ),
+            ],
+        );
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "rel");
+        let g = dedupe(
+            "Saga (2012)",
+            vec![
+                book(
+                    "var",
+                    "S1",
+                    "Saga 002 (2012) (Variant) (hybrid).cbz",
+                    1.0,
+                    900,
+                ),
+                book("yr", "S1", "Saga 002 (2006 2025).cbz", 2.0, 100),
+            ],
+        );
+        assert!(g[0].delete[0].reason.contains("larger"), "{g:?}");
+    }
+
     #[test]
     fn number_string_mismatch_is_misnumbered() {
         let mut b = book("a", "S1", "Saga 018 (2012).cbz", 18.0, 1);
@@ -741,5 +1375,302 @@ mod tests {
         b.metadata.number = "018".into();
         let (planned, _) = renumber_plan(&[lib(&[("S1", "Saga (2012)")], vec![b])], false);
         assert!(planned.is_empty());
+    }
+
+    #[test]
+    fn volumes_never_duplicate_issues() {
+        let g = dedupe(
+            "Lazarus (2013)",
+            vec![
+                book("i7", "S1", "Lazarus 007 (2014) (Digital).cbz", 1.0, 1),
+                book("i8", "S1", "Lazarus 008 (2014) (Digital).cbz", 2.0, 1),
+                book(
+                    "v7",
+                    "S1",
+                    "Lazarus v07 (2023) (Digital) (EJGriffin-Empire).cbz",
+                    3.0,
+                    1,
+                ),
+                book(
+                    "v8",
+                    "S1",
+                    "Lazarus v08 (2026) (Digital) (Forever-Empire).cbz",
+                    4.0,
+                    1,
+                ),
+            ],
+        );
+        assert!(g.is_empty(), "{g:?}");
+        let r = audit(
+            "k",
+            &[lib(
+                &[("S1", "Lazarus (2013)")],
+                vec![
+                    book("i7", "S1", "Lazarus 007 (2014).cbz", 7.0, 1),
+                    book("v7", "S1", "Lazarus v07 (2023).cbz", 2.0, 1),
+                ],
+            )],
+        );
+        assert_eq!(r.summary.collected_editions, 1);
+        assert_eq!(r.summary.misnumbered_books, 0);
+    }
+
+    #[test]
+    fn purge_generic_deletes_every_generic_file_and_lists_orphans() {
+        let data = lib(
+            &[("S1", "The Amazing Spider-Man (2025)")],
+            vec![
+                book(
+                    "g8",
+                    "S1",
+                    "The Amazing Spider-Man (2025) Volume 01 Issue 008.cbz",
+                    1.0,
+                    900,
+                ),
+                book(
+                    "r8",
+                    "S1",
+                    "Amazing Spider-Man 008 (2025) (Digital) (Shan-Empire).cbz",
+                    2.0,
+                    100,
+                ),
+                book(
+                    "g15",
+                    "S1",
+                    "The Amazing Spider-Man (2025) Volume 01 Issue 015.cbz",
+                    3.0,
+                    900,
+                ),
+                book(
+                    "r9",
+                    "S1",
+                    "Amazing Spider-Man 009 (2025) (Digital) (Shan-Empire).cbz",
+                    4.0,
+                    100,
+                ),
+                book("v1", "S1", "Amazing Spider-Man v01 (2025).cbz", 5.0, 100),
+            ],
+        );
+        let g = plan(std::slice::from_ref(&data), true);
+        let rows: Vec<(&str, Option<&str>, Vec<&str>)> = g
+            .iter()
+            .map(|d| {
+                (
+                    d.number.as_str(),
+                    d.keep.as_ref().map(|k| k.book_id.as_str()),
+                    d.delete.iter().map(|l| l.book_id.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("8", Some("r8"), vec!["g8"]), ("15", None, vec!["g15"])]
+        );
+        assert_eq!(
+            orphans(&g, true),
+            vec![OrphanIssue {
+                series_id: "S1".into(),
+                series: "The Amazing Spider-Man".into(),
+                year: Some(2025),
+                issue_number: "15".into(),
+            }]
+        );
+        let last: Vec<(&str, bool)> = g
+            .iter()
+            .flat_map(|d| &d.delete)
+            .map(|l| (l.book_id.as_str(), l.last_copy))
+            .collect();
+        assert_eq!(last, vec![("g8", false), ("g15", true)]);
+        assert!(g[1].delete[0].reason.contains("last copy"));
+        assert!(orphans(&plan(&[data], false), true).is_empty());
+    }
+
+    #[test]
+    fn an_unpaired_twin_is_only_a_possible_copy() {
+        let data = lib(
+            &[("S1", "The Amazing Spider-Man (2025)")],
+            vec![
+                book(
+                    "g15",
+                    "S1",
+                    "The Amazing Spider-Man (2025) Volume 01 Issue 015.cbz",
+                    1.0,
+                    900,
+                ),
+                book(
+                    "fax",
+                    "S1",
+                    "Amazing Spider-Man 015 Facsimile Edition (2025).cbz",
+                    2.0,
+                    100,
+                ),
+                book(
+                    "abs",
+                    "S1",
+                    "Absolute Amazing Spider-Man 016 (2025).cbz",
+                    3.0,
+                    100,
+                ),
+                book(
+                    "g16",
+                    "S1",
+                    "The Amazing Spider-Man (2025) Volume 01 Issue 016.cbz",
+                    4.0,
+                    900,
+                ),
+            ],
+        );
+        let g = plan(&[data], true);
+        assert_eq!(g.len(), 2, "{g:?}");
+        assert_eq!(g[0].number, "15");
+        assert_eq!(g[0].kept_elsewhere.as_ref().unwrap().book_id, "fax");
+        assert!(g[0].delete[0].last_copy);
+        assert!(
+            g[0].delete[0].reason.contains(
+                "possible copy: Amazing Spider-Man 015 Facsimile Edition (2025).cbz (facsimile)"
+            ),
+            "{g:?}"
+        );
+        assert_eq!(g[1].number, "16");
+        assert!(g[1].kept_elsewhere.is_none(), "another comic is no copy");
+        assert!(g[1].delete[0].last_copy);
+        let orphaned: Vec<String> = orphans(&g, true)
+            .into_iter()
+            .map(|o| o.issue_number)
+            .collect();
+        assert_eq!(orphaned, vec!["15", "16"]);
+        assert!(orphans(&g, false).is_empty());
+    }
+
+    #[test]
+    fn different_comics_sharing_a_word_never_pair() {
+        let cases: [(&str, &[&str]); 4] = [
+            (
+                "Batman (2016)",
+                &[
+                    "Batman 001 (2016) (Digital) (Zone-Empire).cbr",
+                    "Absolute Batman 001 (2024) (Digital) (Shan-Empire).cbz",
+                ],
+            ),
+            (
+                "Spider-Man (2016)",
+                &[
+                    "Spider-Man 001 (2016) (Digital) (Zone-Empire).cbr",
+                    "Ultimate Spider-Man 001 (2016) (Digital) (Zone-Empire).cbr",
+                    "Superior Spider-Man 001 (2016) (Digital) (Zone-Empire).cbr",
+                ],
+            ),
+            (
+                "X-Men (2016)",
+                &[
+                    "X-Men 001 (2016) (Digital) (Zone-Empire).cbr",
+                    "Uncanny X-Men 001 (2016) (Digital) (Zone-Empire).cbr",
+                ],
+            ),
+            (
+                "Wonder Woman (2016)",
+                &[
+                    "Wonder Woman 001 (2016) (Digital) (Zone-Empire).cbr",
+                    "Absolute Wonder Woman (2024) Volume 01 Issue 001.cbz",
+                ],
+            ),
+        ];
+        for (series, files) in cases {
+            let books = files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| book(&format!("b{i}"), "S1", f, 1.0, 1))
+                .collect();
+            let data = lib(&[("S1", series)], books);
+            assert!(
+                plan(std::slice::from_ref(&data), false).is_empty(),
+                "{series}"
+            );
+            assert!(plan(&[data], true).is_empty(), "{series} purge");
+        }
+    }
+
+    #[test]
+    fn cover_years_over_a_year_apart_never_pair() {
+        let g = dedupe(
+            "Wonder Woman (2016)",
+            vec![
+                book(
+                    "a",
+                    "S1",
+                    "Wonder Woman 001 (2016) (Digital) (Zone-Empire).cbr",
+                    1.0,
+                    1,
+                ),
+                book(
+                    "b",
+                    "S1",
+                    "Wonder Woman 001 (2023) (Digital) (Shan-Empire).cbz",
+                    2.0,
+                    1,
+                ),
+            ],
+        );
+        assert!(g.is_empty(), "{g:?}");
+        let g = dedupe(
+            "The Amazing Spider-Man (2022)",
+            vec![
+                book(
+                    "a",
+                    "S1",
+                    "Amazing Spider-Man 008 (2022) (Digital) (Zone-Empire).cbr",
+                    1.0,
+                    1,
+                ),
+                book(
+                    "b",
+                    "S1",
+                    "Amazing Spider-Man 008 (2025) (Digital) (Shan-Empire).cbz",
+                    2.0,
+                    1,
+                ),
+            ],
+        );
+        assert!(g.is_empty(), "{g:?}");
+        let g = dedupe(
+            "Saga (2012)",
+            vec![
+                book(
+                    "a",
+                    "S1",
+                    "Saga 012 (2013) (Digital) (Zone-Empire).cbr",
+                    1.0,
+                    1,
+                ),
+                book(
+                    "b",
+                    "S1",
+                    "Saga 012 (2014) (Digital) (Shan-Empire).cbz",
+                    2.0,
+                    2,
+                ),
+            ],
+        );
+        assert_eq!(g.len(), 1);
+        let g = dedupe(
+            "The Amazing Spider-Man (2022)",
+            vec![
+                book(
+                    "a",
+                    "S1",
+                    "Amazing Spider-Man 034 (2023) (Digital) (Shan-Empire).cbz",
+                    1.0,
+                    1,
+                ),
+                book(
+                    "b",
+                    "S1",
+                    "The Amazing Spider-Man (2022) Volume 06 Issue 034.cbr",
+                    2.0,
+                    1,
+                ),
+            ],
+        );
+        assert_eq!(g[0].keep.as_ref().unwrap().book_id, "a");
     }
 }

@@ -6,15 +6,20 @@
 //! Library upkeep:
 //!   - `komga.library.audit`   mis-numbered books, duplicates, misfiled/unparseable files, gaps
 //!   - `komga.books.renumber`  write filename issue numbers back, locked (dry run by default)
+//!   - `komga.books.dedupe`    delete duplicate (and optionally generic) files (dry run by default)
 //!   - `komga.library.scan`    trigger a library scan (dry run by default)
 //!
 //! Libraries default to the one named `comics`: the filename rules are comic
 //! conventions and would misread manga chapters.
 
+use std::collections::BTreeSet;
+
 use plugin_toolkit::prelude::*;
 
 use crate::api::{Komga, Library};
-use crate::audit::{self, AuditReport, LibraryData, Renumber, Skipped};
+use crate::audit::{
+    self, AuditReport, DedupeGroup, DedupeLoser, LibraryData, OrphanIssue, Renumber, Skipped,
+};
 use crate::execute;
 
 #[endpoint_resource(plugin = "komga")]
@@ -225,6 +230,271 @@ async fn komga_books_renumber(args: RenumberArgs, ctx: &ToolCtx) -> Result<Renum
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// komga.books.dedupe
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[orca_struct(args)]
+pub struct DedupeArgs {
+    /// Registered komga endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Komga library id.
+    #[arg(long)]
+    pub library_id: Option<String>,
+    /// Komga series id.
+    #[arg(long)]
+    pub series_id: Option<String>,
+    /// The library named `comics`.
+    #[arg(long)]
+    #[serde(default)]
+    pub all: bool,
+    /// Also delete every generic-named issue file
+    /// (`<Series> (YYYY) Volume NN Issue NNN`), even with no release-named twin.
+    #[arg(long)]
+    #[serde(default)]
+    pub purge_generic: bool,
+    /// Let execute delete an issue's last file (a purged generic with no
+    /// other copy). Omitted, those ids are dropped.
+    #[arg(long)]
+    #[serde(default)]
+    pub allow_orphan: bool,
+    /// Book ids to delete, from the dry run's `delete_book_ids` (execute only).
+    /// Comma-separated on the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub books: Vec<String>,
+    /// Apply. Omitted, returns the plan and deletes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dropped {
+    pub id: String,
+    pub reason: String,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DedupeReport {
+    pub name: String,
+    pub execute: bool,
+    pub purge_generic: bool,
+    pub allow_orphan: bool,
+    /// Per number: the file kept (none when a purge empties it) and each file
+    /// deleted, with why and its size. `last_copy` deletes leave the issue
+    /// with no file.
+    pub groups: Vec<DedupeGroup>,
+    /// Issues execute would leave with no file, for Mylar to re-acquire.
+    /// Empty without `allow_orphan`: last copies are then kept.
+    pub orphaned: Vec<OrphanIssue>,
+    /// Every book id execute would delete; pass these as `books`. Without
+    /// `allow_orphan`, `last_copy` deletes are left out.
+    pub delete_book_ids: Vec<String>,
+    pub delete_bytes: i64,
+    /// Scans run after deleting, per library touched.
+    pub scans: Vec<ScanTarget>,
+    /// Book ids whose file was deleted (execute only).
+    pub deleted: Vec<String>,
+    /// Confirmed ids left alone: no longer in the plan, or a last copy
+    /// without `allow_orphan`.
+    pub dropped: Vec<Dropped>,
+    pub failed: Vec<Failure>,
+}
+
+/// **Remove duplicate files**: per series and issue number, keep one file —
+/// release-named over generic (Mylar tracks release names), then `(Digital)`
+/// over mobile/webrip, then cbz/cbr over pdf, then the larger — and delete the
+/// rest through Komga (`DELETE /books/{id}/file`). Files are paired only when
+/// their series parts agree; volumes only with volumes; soft-deleted or
+/// unreadable books, misfiled files, and guessed numbers never. `purge_generic`
+/// also deletes every generic-named issue file and lists the issues that
+/// leaves without a file; execute deletes such a last copy only with
+/// `allow_orphan`. After deleting, each library that lost a file gets
+/// `emptyTrashAfterScan` and a scan.
+///
+/// Without `execute`, returns the plan and deletes nothing. `execute` deletes
+/// only the `books` passed that are still in the plan; it does not re-check
+/// that the plan is otherwise unchanged.
+#[orca_tool(
+    domain = "komga",
+    verb = "books.dedupe",
+    role = "admin",
+    execute_gated = false
+)]
+async fn komga_books_dedupe(args: DedupeArgs, ctx: &ToolCtx) -> Result<DedupeReport> {
+    const TOOL: &str = "komga.books.dedupe";
+    execute::require_admin(TOOL, ctx)?;
+    require_scope(TOOL, &args.library_id, &args.series_id, args.all)?;
+    books_need_execute(TOOL, args.execute, &args.books)?;
+    let k = connect(&args.name).await?;
+    let data = collect(&k, args.library_id.as_deref(), args.series_id.as_deref()).await?;
+    let groups = audit::dedupe_plan(&data, args.purge_generic);
+    let libraries: Vec<Library> = data.into_iter().map(|d| d.library).collect();
+    let applied = apply_dedupe(
+        &k,
+        &libraries,
+        &groups,
+        &args.books,
+        args.execute,
+        args.allow_orphan,
+    )
+    .await?;
+    Ok(DedupeReport {
+        name: args.name,
+        execute: args.execute,
+        purge_generic: args.purge_generic,
+        allow_orphan: args.allow_orphan,
+        orphaned: audit::orphans(&groups, args.allow_orphan),
+        delete_bytes: deletable(&groups, args.allow_orphan)
+            .map(|(l, _)| l.size_bytes)
+            .sum(),
+        delete_book_ids: deletable(&groups, args.allow_orphan)
+            .map(|(l, _)| l.book_id.clone())
+            .collect(),
+        groups,
+        scans: applied.scans,
+        deleted: applied.deleted,
+        dropped: applied.dropped,
+        failed: applied.failed,
+    })
+}
+
+fn books_need_execute(tool: &str, execute: bool, books: &[String]) -> Result<()> {
+    if !execute && !books.is_empty() {
+        bail!("{tool}: `books` only applies with execute; nothing was deleted");
+    }
+    Ok(())
+}
+
+/// The Komga writes `books.dedupe` makes, so the apply step is testable.
+pub(crate) trait DedupeOps {
+    async fn delete_book_file(&self, book_id: &str) -> Result<()>;
+    async fn enable_empty_trash_after_scan(&self, library_id: &str) -> Result<()>;
+    async fn scan(&self, library_id: &str, deep: bool) -> Result<()>;
+}
+
+impl DedupeOps for Komga {
+    async fn delete_book_file(&self, book_id: &str) -> Result<()> {
+        Komga::delete_book_file(self, book_id).await
+    }
+    async fn enable_empty_trash_after_scan(&self, library_id: &str) -> Result<()> {
+        Komga::enable_empty_trash_after_scan(self, library_id).await
+    }
+    async fn scan(&self, library_id: &str, deep: bool) -> Result<()> {
+        Komga::scan(self, library_id, deep).await
+    }
+}
+
+#[derive(Debug, Default)]
+struct DedupeApplied {
+    scans: Vec<ScanTarget>,
+    deleted: Vec<String>,
+    dropped: Vec<Dropped>,
+    failed: Vec<Failure>,
+}
+
+/// Planned deletes execute may act on, with their library.
+fn deletable(
+    groups: &[DedupeGroup],
+    allow_orphan: bool,
+) -> impl Iterator<Item = (&DedupeLoser, &str)> {
+    groups.iter().flat_map(move |g| {
+        g.delete
+            .iter()
+            .filter(move |l| allow_orphan || !l.last_copy)
+            .map(move |l| (l, g.library_id.as_str()))
+    })
+}
+
+/// Dry run: the scans the plan would trigger. Execute: delete each confirmed
+/// id still in the plan, then rescan only libraries that lost a file. A
+/// normal scan suffices with `emptyTrashAfterScan` on: it drops the books
+/// whose files are gone.
+async fn apply_dedupe<O: DedupeOps>(
+    ops: &O,
+    libraries: &[Library],
+    groups: &[DedupeGroup],
+    confirmed: &[String],
+    execute: bool,
+    allow_orphan: bool,
+) -> Result<DedupeApplied> {
+    const TOOL: &str = "komga.books.dedupe";
+    let planned: Vec<(&str, &str)> = deletable(groups, allow_orphan)
+        .map(|(l, lib)| (l.book_id.as_str(), lib))
+        .collect();
+    let last_copies: BTreeSet<&str> = groups
+        .iter()
+        .flat_map(|g| &g.delete)
+        .filter(|l| l.last_copy && !allow_orphan)
+        .map(|l| l.book_id.as_str())
+        .collect();
+    let planned_ids: Vec<String> = planned.iter().map(|(id, _)| id.to_string()).collect();
+    let mut out = DedupeApplied::default();
+    let mut touched: BTreeSet<&str> = planned.iter().map(|(_, lib)| *lib).collect();
+    if execute {
+        if confirmed.is_empty() && !planned_ids.is_empty() {
+            bail!("{TOOL}: execute needs `books` from the dry run's delete_book_ids");
+        }
+        let (act, dropped) = execute::intersect(confirmed, &planned_ids);
+        out.dropped = dropped
+            .into_iter()
+            .map(|id| Dropped {
+                reason: if last_copies.contains(id.as_str()) {
+                    "last copy; pass allow_orphan".into()
+                } else {
+                    "not in the current plan".into()
+                },
+                id,
+            })
+            .collect();
+        touched.clear();
+        for id in act {
+            match ops.delete_book_file(&id).await {
+                Ok(()) => {
+                    if let Some((_, lib)) = planned.iter().find(|(b, _)| *b == id) {
+                        touched.insert(lib);
+                    }
+                    out.deleted.push(id);
+                }
+                Err(e) => out.failed.push(Failure {
+                    id,
+                    error: format!("{e:#}"),
+                }),
+            }
+        }
+    }
+    for lib in libraries.iter().filter(|l| touched.contains(l.id.as_str())) {
+        let mut t = ScanTarget {
+            library_id: lib.id.clone(),
+            library_name: lib.name.clone(),
+            deep: false,
+            enable_empty_trash_after_scan: !lib.empty_trash_after_scan,
+            triggered: false,
+        };
+        if execute {
+            let step = async {
+                if t.enable_empty_trash_after_scan {
+                    ops.enable_empty_trash_after_scan(&lib.id).await?;
+                }
+                ops.scan(&lib.id, false).await
+            };
+            match step.await {
+                Ok(()) => t.triggered = true,
+                Err(e) => out.failed.push(Failure {
+                    id: lib.id.clone(),
+                    error: format!("{e:#}"),
+                }),
+            }
+        }
+        out.scans.push(t);
+    }
+    Ok(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // komga.library.scan
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -252,6 +522,9 @@ pub struct ScanTarget {
     pub library_id: String,
     pub library_name: String,
     pub deep: bool,
+    /// `emptyTrashAfterScan` is off and gets turned on first, so deleted
+    /// books do not linger.
+    pub enable_empty_trash_after_scan: bool,
     pub triggered: bool,
 }
 
@@ -283,6 +556,7 @@ async fn komga_library_scan(args: ScanArgs, ctx: &ToolCtx) -> Result<ScanReport>
             library_id: lib.id.clone(),
             library_name: lib.name.clone(),
             deep: args.deep,
+            enable_empty_trash_after_scan: false,
             triggered: false,
         };
         if args.execute {
@@ -316,12 +590,205 @@ mod tests {
         assert!(require_scope("t", &None, &Some("S".into()), false).is_ok());
     }
 
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Mock {
+        calls: Mutex<Vec<String>>,
+        fail_delete: Option<&'static str>,
+    }
+
+    impl DedupeOps for Mock {
+        async fn delete_book_file(&self, book_id: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("delete {book_id}"));
+            if self.fail_delete == Some(book_id) {
+                bail!("boom");
+            }
+            Ok(())
+        }
+        async fn enable_empty_trash_after_scan(&self, library_id: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("trash {library_id}"));
+            Ok(())
+        }
+        async fn scan(&self, library_id: &str, deep: bool) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("scan {library_id} deep={deep}"));
+            Ok(())
+        }
+    }
+
     fn library(id: &str, empty_trash: bool) -> Library {
         Library {
             id: id.into(),
             name: id.into(),
             empty_trash_after_scan: empty_trash,
         }
+    }
+
+    fn group(lib: &str, delete: &[&str]) -> DedupeGroup {
+        DedupeGroup {
+            library_id: lib.into(),
+            series_id: "S".into(),
+            series_name: "S (2000)".into(),
+            number: "1".into(),
+            keep: None,
+            kept_elsewhere: None,
+            delete: delete
+                .iter()
+                .map(|id| DedupeLoser {
+                    book_id: (*id).into(),
+                    file: format!("{id}.cbz"),
+                    size_bytes: 1,
+                    reason: "r".into(),
+                    last_copy: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn dry_run_touches_nothing_and_lists_scans() {
+        let m = Mock::default();
+        let libs = [library("L1", true), library("L2", false)];
+        let out = apply_dedupe(&m, &libs, &[group("L1", &["a"])], &[], false, false)
+            .await
+            .unwrap();
+        assert!(m.calls.lock().unwrap().is_empty());
+        assert_eq!(out.scans.len(), 1);
+        assert_eq!(out.scans[0].library_id, "L1");
+        assert!(!out.scans[0].deep);
+    }
+
+    #[tokio::test]
+    async fn execute_deletes_confirmed_planned_ids_and_scans_touched_libraries() {
+        let m = Mock {
+            fail_delete: Some("c"),
+            ..Default::default()
+        };
+        let libs = [
+            library("L1", true),
+            library("L2", false),
+            library("L3", false),
+        ];
+        let groups = [
+            group("L1", &["a"]),
+            group("L2", &["c"]),
+            group("L3", &["d"]),
+        ];
+        let out = apply_dedupe(
+            &m,
+            &libs,
+            &groups,
+            &strs(&["a", "c", "zz", "a"]),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.deleted, vec!["a"]);
+        assert_eq!(
+            out.dropped,
+            vec![Dropped {
+                id: "zz".into(),
+                reason: "not in the current plan".into(),
+            }]
+        );
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].id, "c");
+        assert_eq!(
+            *m.calls.lock().unwrap(),
+            strs(&["delete a", "delete c", "scan L1 deep=false"])
+        );
+        assert_eq!(out.scans.len(), 1);
+        assert!(out.scans[0].triggered);
+    }
+
+    #[tokio::test]
+    async fn execute_turns_on_empty_trash_before_scanning() {
+        let m = Mock::default();
+        let libs = [library("L2", false)];
+        apply_dedupe(
+            &m,
+            &libs,
+            &[group("L2", &["b"])],
+            &strs(&["b"]),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *m.calls.lock().unwrap(),
+            strs(&["delete b", "trash L2", "scan L2 deep=false"])
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_without_confirmed_ids_is_refused() {
+        let m = Mock::default();
+        let libs = [library("L1", true)];
+        assert!(
+            apply_dedupe(&m, &libs, &[group("L1", &["a"])], &[], true, false)
+                .await
+                .is_err()
+        );
+        assert!(m.calls.lock().unwrap().is_empty());
+    }
+
+    fn last_copy(lib: &str, id: &str) -> DedupeGroup {
+        let mut g = group(lib, &[id]);
+        g.delete[0].last_copy = true;
+        g
+    }
+
+    #[tokio::test]
+    async fn last_copies_need_allow_orphan() {
+        let libs = [library("L1", true)];
+        let groups = [group("L1", &["a"]), last_copy("L1", "o")];
+        let m = Mock::default();
+        let out = apply_dedupe(&m, &libs, &groups, &strs(&["a", "o"]), true, false)
+            .await
+            .unwrap();
+        assert_eq!(out.deleted, vec!["a"]);
+        assert_eq!(
+            out.dropped,
+            vec![Dropped {
+                id: "o".into(),
+                reason: "last copy; pass allow_orphan".into(),
+            }]
+        );
+        assert_eq!(
+            deletable(&groups, false)
+                .map(|(l, _)| l.book_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+
+        let m = Mock::default();
+        let out = apply_dedupe(&m, &libs, &groups, &strs(&["a", "o"]), true, true)
+            .await
+            .unwrap();
+        assert_eq!(out.deleted, vec!["a", "o"]);
+        assert!(out.dropped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_library_with_only_last_copies_is_not_scanned_without_allow_orphan() {
+        let m = Mock::default();
+        let libs = [library("L1", true)];
+        let out = apply_dedupe(&m, &libs, &[last_copy("L1", "o")], &[], false, false)
+            .await
+            .unwrap();
+        assert!(out.scans.is_empty());
     }
 
     #[test]
@@ -333,10 +800,25 @@ mod tests {
     }
 
     #[test]
+    fn books_without_execute_is_refused() {
+        let err = books_need_execute("t", false, &strs(&["a"])).unwrap_err();
+        assert!(
+            err.to_string().contains("only applies with execute"),
+            "{err}"
+        );
+        assert!(books_need_execute("t", false, &[]).is_ok());
+        assert!(books_need_execute("t", true, &strs(&["a"])).is_ok());
+    }
+
+    /// The host reads gating from the manifest these constants feed: a
+    /// gated audit returns a plan instead of running, and a gated mutation
+    /// would hide this plugin's own dry run behind a generic one.
+    #[test]
     fn library_tools_are_not_host_execute_gated() {
-        const OWN: [&str; 3] = [
+        const OWN: [&str; 4] = [
             "komga.library.audit",
             "komga.books.renumber",
+            "komga.books.dedupe",
             "komga.library.scan",
         ];
         let gated: Vec<&str> = plugin_toolkit::dispatch::execute_gated_names()
@@ -346,7 +828,11 @@ mod tests {
         assert!(gated.is_empty(), "{gated:?}");
         let role = |n| plugin_toolkit::dispatch::required_role(n);
         assert_eq!(role("komga.library.audit"), Some("read"));
-        for n in ["komga.books.renumber", "komga.library.scan"] {
+        for n in [
+            "komga.books.renumber",
+            "komga.books.dedupe",
+            "komga.library.scan",
+        ] {
             assert_eq!(role(n), Some("admin"), "{n}");
         }
     }
