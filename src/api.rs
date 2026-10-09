@@ -80,6 +80,18 @@ impl Book {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+pub struct ReadList {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub ordered: bool,
+    pub book_ids: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
 struct Page<T> {
@@ -99,6 +111,12 @@ impl HasId for Series {
 }
 
 impl HasId for Book {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for ReadList {
     fn id(&self) -> &str {
         &self.id
     }
@@ -168,6 +186,24 @@ struct NumberPatch<'a> {
 #[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
 struct EmptyTrashPatch {
     empty_trash_after_scan: bool,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct ReadListCreate<'a> {
+    name: &'a str,
+    summary: &'a str,
+    ordered: bool,
+    book_ids: &'a [String],
+}
+
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct ReadListPatch<'a> {
+    ordered: bool,
+    book_ids: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'a str>,
 }
 
 /// Komga ids are alphanumeric; anything else would reshape the request path.
@@ -253,6 +289,56 @@ impl Komga {
     pub async fn series_books(&self, series_id: &str) -> Result<Vec<Book>> {
         self.listing(&format!("series/{}/books", check_id(series_id)?))
             .await
+    }
+
+    pub async fn book(&self, id: &str) -> Result<Book> {
+        self.get(&format!("books/{}", check_id(id)?)).await
+    }
+
+    pub async fn readlists(&self) -> Result<Vec<ReadList>> {
+        self.listing("readlists").await
+    }
+
+    /// Returns the new readlist's id.
+    pub async fn create_readlist(
+        &self,
+        name: &str,
+        summary: &str,
+        book_ids: &[String],
+    ) -> Result<String> {
+        let body = ReadListCreate {
+            name,
+            summary,
+            ordered: true,
+            book_ids,
+        };
+        let resp = self
+            .send(
+                self.http.post(self.url("readlists")).json(&body),
+                "readlists",
+            )
+            .await?;
+        let created: ReadList =
+            serde_json::from_slice(&resp).map_err(|e| anyhow!("decode komga readlists: {e}"))?;
+        Ok(created.id)
+    }
+
+    /// Replaces the book list, in order; `summary` `None` leaves it as is.
+    pub async fn update_readlist(
+        &self,
+        id: &str,
+        book_ids: &[String],
+        summary: Option<&str>,
+    ) -> Result<()> {
+        let path = format!("readlists/{}", check_id(id)?);
+        let body = ReadListPatch {
+            ordered: true,
+            book_ids,
+            summary,
+        };
+        self.send(self.http.patch(self.url(&path)).json(&body), &path)
+            .await
+            .map(drop)
     }
 
     /// Set number and sort number with both locks, so rescans keep them.

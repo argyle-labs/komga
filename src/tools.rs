@@ -8,19 +8,23 @@
 //!   - `komga.books.renumber`  write filename issue numbers back, locked (dry run by default)
 //!   - `komga.books.dedupe`    delete duplicate (and optionally generic) files (dry run by default)
 //!   - `komga.library.scan`    trigger a library scan (dry run by default)
+//!   - `komga.readlist.sync`   create or rewrite an ordered readlist (dry run by default)
 //!
 //! Libraries default to the one named `comics`: the filename rules are comic
 //! conventions and would misread manga chapters.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use plugin_toolkit::prelude::*;
 
-use crate::api::{Komga, Library};
+use crate::api::{check_id, Komga, Library, ReadList};
 use crate::audit::{
     self, AuditReport, DedupeGroup, DedupeLoser, LibraryData, OrphanIssue, Renumber, Skipped,
 };
 use crate::execute;
+use crate::readlist::{
+    self, Catalog, ReadlistDiff, ReadlistEntry, ResolvedEntry, SeriesMatch, UnresolvedEntry,
+};
 
 #[endpoint_resource(plugin = "komga")]
 pub struct KomgaEndpoint {
@@ -578,6 +582,242 @@ async fn komga_library_scan(args: ScanArgs, ctx: &ToolCtx) -> Result<ScanReport>
     })
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// komga.readlist.sync
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[orca_struct(args)]
+pub struct ReadlistSyncArgs {
+    /// Registered komga endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Readlist name; created when no readlist has it.
+    #[arg(long)]
+    pub readlist: String,
+    /// Entries in reading order: `<series>#<number>` (series name or id), or
+    /// a JSON object `{"series":..,"number":..}` / `{"book":"<id>"}`.
+    /// Repeatable.
+    #[arg(long = "entry", value_parser = readlist::parse_entry, action = clap::ArgAction::Append)]
+    #[serde(default)]
+    pub entries: Vec<ReadlistEntry>,
+    /// Readlist summary. Omitted, an existing summary is kept.
+    #[arg(long)]
+    pub summary: Option<String>,
+    /// Komga library id that series names resolve in. Omitted, the library
+    /// named `comics`.
+    #[arg(long)]
+    pub library_id: Option<String>,
+    /// The dry run's `book_ids`, in order (execute only). Comma-separated on
+    /// the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub book_ids: Vec<String>,
+    /// Apply. Omitted, returns the plan and changes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadlistSyncReport {
+    pub name: String,
+    pub readlist: String,
+    pub execute: bool,
+    /// The readlist's books in order; pass these as `book_ids` to execute.
+    pub book_ids: Vec<String>,
+    pub resolved: Vec<ResolvedEntry>,
+    /// Entries matching no book, or more than one; execute refuses while any
+    /// remain.
+    pub unresolved: Vec<UnresolvedEntry>,
+    pub diff: ReadlistDiff,
+    /// Id of the readlist written (execute only).
+    pub applied: Option<String>,
+}
+
+/// **Build an ordered readlist**: resolve each entry (series name or id plus
+/// issue number, or a book id) to one book, then create the readlist
+/// (`POST /readlists`) or replace its books in order (`PATCH /readlists/{id}`).
+/// An entry matching several books is reported with every candidate and never
+/// guessed. Without `execute`, returns the resolved order, the unresolved
+/// entries, and the diff against the existing readlist. `execute` needs the
+/// dry run's `book_ids` unchanged and every entry resolved.
+#[orca_tool(
+    domain = "komga",
+    verb = "readlist.sync",
+    role = "admin",
+    execute_gated = false
+)]
+async fn komga_readlist_sync(args: ReadlistSyncArgs, ctx: &ToolCtx) -> Result<ReadlistSyncReport> {
+    const TOOL: &str = "komga.readlist.sync";
+    execute::require_admin(TOOL, ctx)?;
+    if args.readlist.trim().is_empty() {
+        bail!("{TOOL}: readlist name is empty");
+    }
+    if !args.execute && !args.book_ids.is_empty() {
+        bail!("{TOOL}: `book_ids` only applies with execute; nothing was written");
+    }
+    let k = connect(&args.name).await?;
+    let cat = readlist_catalog(&k, args.library_id.as_deref(), &args.entries).await?;
+    let (resolved, unresolved) = readlist::resolve(&args.entries, &cat);
+    let book_ids: Vec<String> = resolved.iter().map(|r| r.book.book_id.clone()).collect();
+    let existing = find_readlist(&k.readlists().await?, &args.readlist)?;
+    let diff = readlist::diff(existing.as_ref(), &book_ids, args.summary.as_deref());
+    let applied = if args.execute {
+        apply_readlist(
+            &k,
+            &args.readlist,
+            args.summary.as_deref(),
+            &diff,
+            &book_ids,
+            unresolved.len(),
+            &args.book_ids,
+        )
+        .await?
+    } else {
+        None
+    };
+    Ok(ReadlistSyncReport {
+        name: args.name,
+        readlist: args.readlist,
+        execute: args.execute,
+        book_ids,
+        resolved,
+        unresolved,
+        diff,
+        applied,
+    })
+}
+
+async fn readlist_catalog(
+    k: &Komga,
+    library_id: Option<&str>,
+    entries: &[ReadlistEntry],
+) -> Result<Catalog> {
+    let mut series = Vec::new();
+    for lib in libraries_in_scope(k, library_id).await? {
+        series.extend(k.library_series(&lib.id).await?);
+    }
+    let mut books = BTreeMap::new();
+    let mut direct = BTreeMap::new();
+    for e in entries {
+        if let Some(id) = &e.book {
+            if !direct.contains_key(id) {
+                let found = match check_id(id) {
+                    Ok(id) => k.book(id).await,
+                    Err(e) => Err(e),
+                };
+                direct.insert(id.clone(), found.map_err(|e| format!("{e:#}")));
+            }
+        }
+        if let Some(key) = &e.series {
+            if let SeriesMatch::One(s) = readlist::find_series(&series, key) {
+                if !books.contains_key(&s.id) {
+                    books.insert(s.id.clone(), k.series_books(&s.id).await?);
+                }
+            }
+        }
+    }
+    Ok(Catalog {
+        series,
+        books,
+        direct,
+    })
+}
+
+/// Komga treats readlist names as unique regardless of case.
+fn find_readlist(all: &[ReadList], name: &str) -> Result<Option<ReadList>> {
+    let hits: Vec<&ReadList> = all
+        .iter()
+        .filter(|r| r.name.trim().to_lowercase() == name.trim().to_lowercase())
+        .collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
+        many => bail!(
+            "{} readlists are named '{name}': {}",
+            many.len(),
+            many.iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The Komga writes `readlist.sync` makes, so the apply step is testable.
+pub(crate) trait ReadlistOps {
+    async fn create_readlist(
+        &self,
+        name: &str,
+        summary: &str,
+        book_ids: &[String],
+    ) -> Result<String>;
+    async fn update_readlist(
+        &self,
+        id: &str,
+        book_ids: &[String],
+        summary: Option<&str>,
+    ) -> Result<()>;
+}
+
+impl ReadlistOps for Komga {
+    async fn create_readlist(
+        &self,
+        name: &str,
+        summary: &str,
+        book_ids: &[String],
+    ) -> Result<String> {
+        Komga::create_readlist(self, name, summary, book_ids).await
+    }
+    async fn update_readlist(
+        &self,
+        id: &str,
+        book_ids: &[String],
+        summary: Option<&str>,
+    ) -> Result<()> {
+        Komga::update_readlist(self, id, book_ids, summary).await
+    }
+}
+
+/// Writes only a fully resolved plan the operator confirmed verbatim: a
+/// readlist is replaced whole, so a partial or reshuffled list would lose
+/// entries silently.
+async fn apply_readlist<O: ReadlistOps>(
+    ops: &O,
+    name: &str,
+    summary: Option<&str>,
+    diff: &ReadlistDiff,
+    want: &[String],
+    unresolved: usize,
+    confirmed: &[String],
+) -> Result<Option<String>> {
+    const TOOL: &str = "komga.readlist.sync";
+    if unresolved > 0 {
+        bail!("{TOOL}: {unresolved} entries are unresolved; nothing was written");
+    }
+    if want.is_empty() {
+        bail!("{TOOL}: no books to write");
+    }
+    if confirmed != want {
+        bail!(
+            "{TOOL}: execute needs `book_ids` equal to the dry run's, in order; the plan differs"
+        );
+    }
+    match (diff.action.as_str(), &diff.readlist_id) {
+        ("none", id) => Ok(id.clone()),
+        ("create", _) => ops
+            .create_readlist(name, summary.unwrap_or(""), want)
+            .await
+            .map(Some),
+        ("update", Some(id)) => ops
+            .update_readlist(id, want, summary)
+            .await
+            .map(|()| Some(id.clone())),
+        (action, _) => bail!("{TOOL}: unexpected plan action '{action}'"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,16 +1050,122 @@ mod tests {
         assert!(books_need_execute("t", true, &strs(&["a"])).is_ok());
     }
 
+    impl ReadlistOps for Mock {
+        async fn create_readlist(
+            &self,
+            name: &str,
+            summary: &str,
+            book_ids: &[String],
+        ) -> Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create {name} [{summary}] {}", book_ids.join(",")));
+            Ok("NEW".into())
+        }
+        async fn update_readlist(
+            &self,
+            id: &str,
+            book_ids: &[String],
+            summary: Option<&str>,
+        ) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("update {id} {summary:?} {}", book_ids.join(",")));
+            Ok(())
+        }
+    }
+
+    fn plan(action: &str, id: Option<&str>) -> ReadlistDiff {
+        ReadlistDiff {
+            action: action.into(),
+            readlist_id: id.map(Into::into),
+            added: Vec::new(),
+            removed: Vec::new(),
+            reordered: false,
+            summary_changed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn readlist_creates_or_updates_the_confirmed_order() {
+        let m = Mock::default();
+        let want = strs(&["b", "a"]);
+        let id = apply_readlist(&m, "SW", None, &plan("create", None), &want, 0, &want)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("NEW"));
+        apply_readlist(
+            &m,
+            "SW",
+            Some("s"),
+            &plan("update", Some("R")),
+            &want,
+            0,
+            &want,
+        )
+        .await
+        .unwrap();
+        apply_readlist(&m, "SW", None, &plan("none", Some("R")), &want, 0, &want)
+            .await
+            .unwrap();
+        assert_eq!(
+            *m.calls.lock().unwrap(),
+            strs(&["create SW [] b,a", "update R Some(\"s\") b,a"])
+        );
+    }
+
+    #[tokio::test]
+    async fn readlist_refuses_unresolved_or_unconfirmed_plans() {
+        let m = Mock::default();
+        let want = strs(&["a", "b"]);
+        let p = plan("update", Some("R"));
+        assert!(apply_readlist(&m, "SW", None, &p, &want, 1, &want)
+            .await
+            .is_err());
+        assert!(apply_readlist(&m, "SW", None, &p, &want, 0, &[])
+            .await
+            .is_err());
+        let reversed = strs(&["b", "a"]);
+        assert!(apply_readlist(&m, "SW", None, &p, &want, 0, &reversed)
+            .await
+            .is_err());
+        assert!(apply_readlist(&m, "SW", None, &p, &[], 0, &[])
+            .await
+            .is_err());
+        assert!(m.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn readlist_name_matches_regardless_of_case() {
+        let r = |id: &str, name: &str| ReadList {
+            id: id.into(),
+            name: name.into(),
+            summary: String::new(),
+            ordered: true,
+            book_ids: Vec::new(),
+        };
+        let all = [r("R1", "Secret Wars"), r("R2", "Other")];
+        assert_eq!(
+            find_readlist(&all, " secret wars").unwrap().unwrap().id,
+            "R1"
+        );
+        assert!(find_readlist(&all, "Nope").unwrap().is_none());
+        assert!(find_readlist(&[r("R1", "x"), r("R2", "X")], "x").is_err());
+    }
+
     /// The host reads gating from the manifest these constants feed: a
     /// gated audit returns a plan instead of running, and a gated mutation
     /// would hide this plugin's own dry run behind a generic one.
     #[test]
     fn library_tools_are_not_host_execute_gated() {
-        const OWN: [&str; 4] = [
+        const OWN: [&str; 5] = [
             "komga.library.audit",
             "komga.books.renumber",
             "komga.books.dedupe",
             "komga.library.scan",
+            "komga.readlist.sync",
         ];
         let gated: Vec<&str> = plugin_toolkit::dispatch::execute_gated_names()
             .into_iter()
@@ -832,6 +1178,7 @@ mod tests {
             "komga.books.renumber",
             "komga.books.dedupe",
             "komga.library.scan",
+            "komga.readlist.sync",
         ] {
             assert_eq!(role(n), Some("admin"), "{n}");
         }

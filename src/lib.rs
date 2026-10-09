@@ -2,7 +2,7 @@
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
 //! (deploy/backup/restore/configure/status/connect/sync) drive komga,
-//! alongside the `komga.` library audit/renumber/dedupe/scan tools in
+//! alongside the `komga.` library audit/renumber/dedupe/scan and readlist tools in
 //! [`tools`]. The only orca dep is `plugin-toolkit`. See
 //! orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
@@ -11,6 +11,7 @@ pub mod api;
 pub mod audit;
 pub mod execute;
 pub mod parse;
+pub mod readlist;
 pub mod tools;
 
 use plugin_toolkit::service::{

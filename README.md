@@ -88,6 +88,8 @@ orca komga.books.renumber --name komga --series-id <id> --execute
 orca komga.books.dedupe --name komga --all --purge-generic   # dry run: keep/delete per number
 orca komga.books.dedupe --name komga --all --purge-generic --books <ids> --execute
 orca komga.library.scan --name komga --library-id <id> --deep --execute
+orca komga.readlist.sync --name komga --readlist 'Secret Wars' --entry 'Secret Wars (2015)#1' --entry 'Secret Wars (2015)#2'   # dry run: order, unresolved, diff
+orca komga.readlist.sync --name komga --readlist 'Secret Wars' --entry ... --book-ids <ids> --execute
 ```
 
 Komga numbers books by sort order, not by the number in the filename, so a
