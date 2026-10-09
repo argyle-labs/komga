@@ -28,6 +28,15 @@ pub struct Series {
     pub library_id: String,
     /// Folder name; the title can differ when ComicInfo sets one.
     pub name: String,
+    #[serde(default)]
+    pub metadata: SeriesMetadata,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct SeriesMetadata {
+    #[serde(default)]
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +89,18 @@ impl Book {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+pub struct ReadList {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub ordered: bool,
+    pub book_ids: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
 struct Page<T> {
@@ -99,6 +120,12 @@ impl HasId for Series {
 }
 
 impl HasId for Book {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl HasId for ReadList {
     fn id(&self) -> &str {
         &self.id
     }
@@ -153,6 +180,39 @@ impl<T: HasId> Pager<T> {
         }
         Ok(self.items)
     }
+}
+
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct NumberPatch<'a> {
+    number: &'a str,
+    number_sort: f64,
+    number_lock: bool,
+    number_sort_lock: bool,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct EmptyTrashPatch {
+    empty_trash_after_scan: bool,
+}
+
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct ReadListCreate<'a> {
+    name: &'a str,
+    summary: &'a str,
+    ordered: bool,
+    book_ids: &'a [String],
+}
+
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct ReadListPatch<'a> {
+    ordered: bool,
+    book_ids: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'a str>,
 }
 
 /// Komga ids are alphanumeric; anything else would reshape the request path.
@@ -240,6 +300,88 @@ impl Komga {
             .await
     }
 
+    pub async fn book(&self, id: &str) -> Result<Book> {
+        self.get(&format!("books/{}", check_id(id)?)).await
+    }
+
+    pub async fn readlists(&self) -> Result<Vec<ReadList>> {
+        self.listing("readlists").await
+    }
+
+    /// Returns the new readlist's id.
+    pub async fn create_readlist(
+        &self,
+        name: &str,
+        summary: &str,
+        book_ids: &[String],
+    ) -> Result<String> {
+        let body = ReadListCreate {
+            name,
+            summary,
+            ordered: true,
+            book_ids,
+        };
+        let resp = self
+            .send(
+                self.http.post(self.url("readlists")).json(&body),
+                "readlists",
+            )
+            .await?;
+        let created: ReadList =
+            serde_json::from_slice(&resp).map_err(|e| anyhow!("decode komga readlists: {e}"))?;
+        Ok(created.id)
+    }
+
+    /// Replaces the book list, in order; `summary` `None` leaves it as is.
+    pub async fn update_readlist(
+        &self,
+        id: &str,
+        book_ids: &[String],
+        summary: Option<&str>,
+    ) -> Result<()> {
+        let path = format!("readlists/{}", check_id(id)?);
+        let body = ReadListPatch {
+            ordered: true,
+            book_ids,
+            summary,
+        };
+        self.send(self.http.patch(self.url(&path)).json(&body), &path)
+            .await
+            .map(drop)
+    }
+
+    /// Set number and sort number with both locks, so rescans keep them.
+    pub async fn set_number(&self, book_id: &str, number: &str, number_sort: f64) -> Result<()> {
+        let path = format!("books/{}/metadata", check_id(book_id)?);
+        let body = NumberPatch {
+            number,
+            number_sort,
+            number_lock: true,
+            number_sort_lock: true,
+        };
+        self.send(self.http.patch(self.url(&path)).json(&body), &path)
+            .await
+            .map(drop)
+    }
+
+    /// Delete the book's file from disk through Komga, which drops the book.
+    pub async fn delete_book_file(&self, book_id: &str) -> Result<()> {
+        let path = format!("books/{}/file", check_id(book_id)?);
+        self.send(self.http.delete(self.url(&path)), &path)
+            .await
+            .map(drop)
+    }
+
+    pub async fn enable_empty_trash_after_scan(&self, library_id: &str) -> Result<()> {
+        let path = format!("libraries/{}", check_id(library_id)?);
+        let body = EmptyTrashPatch {
+            empty_trash_after_scan: true,
+        };
+        self.send(self.http.patch(self.url(&path)).json(&body), &path)
+            .await
+            .map(drop)
+    }
+
     pub async fn scan(&self, library_id: &str, deep: bool) -> Result<()> {
         let path = format!("libraries/{}/scan?deep={deep}", check_id(library_id)?);
         self.send(self.http.post(self.url(&path)), &path)
@@ -276,6 +418,7 @@ mod tests {
                     id: (*id).into(),
                     library_id: "L".into(),
                     name: "s".into(),
+                    metadata: Default::default(),
                 })
                 .collect(),
             last,
@@ -317,6 +460,21 @@ mod tests {
         let mut p = Pager::new();
         p.push(page(&["a"], false, 2)).unwrap();
         assert!(p.push(page(&["b"], true, 3)).is_err());
+    }
+
+    #[test]
+    fn readlist_patch_omits_absent_summary() {
+        let ids = vec!["a".to_string()];
+        let body = |summary| {
+            serde_json::to_value(ReadListPatch {
+                ordered: true,
+                book_ids: &ids,
+                summary,
+            })
+            .unwrap()
+        };
+        assert_eq!(body(None), json!({"ordered": true, "bookIds": ["a"]}));
+        assert_eq!(body(Some("s"))["summary"], "s");
     }
 
     #[test]
