@@ -24,9 +24,17 @@ path = "src/main.rs"
 [dependencies]
 plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "delegated-http"] }
 
+# Names the generated client's own crate-root paths: the codegen rewrites
+# serde/serde_json/reqwest/progenitor_client to `::plugin_toolkit::*`, but emits
+# bare `::thiserror`.
+thiserror = "2"
+
 [dev-dependencies]
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+
+[build-dependencies]
+plugin-toolkit-build = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 [lints.clippy]
 let_underscore_must_use = "deny"
