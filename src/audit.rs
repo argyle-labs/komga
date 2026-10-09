@@ -1,5 +1,6 @@
-//! Library analysis for `komga.library.audit`. Pure over fetched Komga
-//! records, so every rule is testable without a server.
+//! Library analysis and the plans built from it: `komga.library.audit`,
+//! `komga.books.renumber`. Pure over fetched Komga records, so every rule is
+//! testable without a server.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -350,6 +351,8 @@ pub struct AuditSummary {
     pub books: usize,
     pub misnumbered_books: usize,
     pub misnumbered_series: usize,
+    /// Mis-numbered books `komga.books.renumber` would fix without `force`.
+    pub renumberable_books: usize,
     pub duplicate_numbers: usize,
     pub duplicate_series: usize,
     pub misfiled_books: usize,
@@ -368,6 +371,7 @@ impl AuditSummary {
         self.books += o.books;
         self.misnumbered_books += o.misnumbered_books;
         self.misnumbered_series += o.misnumbered_series;
+        self.renumberable_books += o.renumberable_books;
         self.duplicate_numbers += o.duplicate_numbers;
         self.duplicate_series += o.duplicate_series;
         self.misfiled_books += o.misfiled_books;
@@ -423,6 +427,11 @@ fn audit_library(data: &LibraryData) -> LibraryAudit {
         summary.books += a.books;
         summary.misnumbered_books += a.misnumbered.len();
         summary.misnumbered_series += usize::from(!a.misnumbered.is_empty());
+        summary.renumberable_books += v
+            .entries
+            .iter()
+            .filter(|e| renumber_skip(e, false).is_none())
+            .count();
         summary.duplicate_numbers += a.duplicates.len();
         summary.duplicate_series += usize::from(!a.duplicates.is_empty());
         summary.misfiled_books += a.misfiled.len();
@@ -520,6 +529,98 @@ fn audit_series(v: &SeriesView<'_>) -> SeriesAudit {
     a
 }
 
+// ── renumber ───────────────────────────────────────────────────────────────
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Renumber {
+    pub book_id: String,
+    pub series_name: String,
+    pub file: String,
+    pub current_number: String,
+    pub current_sort: f64,
+    /// Written as `number` with `numberLock`.
+    pub number: String,
+    /// Written as `numberSort` with `numberSortLock`.
+    pub number_sort: f64,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skipped {
+    pub book_id: String,
+    pub series_name: String,
+    pub file: String,
+    pub reason: String,
+}
+
+/// Why a book is not renumbered, or `None` when it is planned. Books Komga
+/// already numbers right are neither.
+fn renumber_skip(e: &Entry<'_>, force: bool) -> Option<Option<String>> {
+    let Some(p) = &e.name.parsed else {
+        return Some(Some("no number in the filename".into()));
+    };
+    if p.kind == Kind::Volume || !e.misnumbered() {
+        return Some(None);
+    }
+    if let Some(edge) = p.edge {
+        let why = match edge {
+            Edge::Decimal => "decimal issue number",
+            Edge::Suffixed => "number carries a suffix",
+            Edge::Ambiguous => "#N with another number after it",
+            Edge::Facsimile => "facsimile edition",
+            Edge::Annual => "annual filed in a non-annual series",
+            Edge::SeriesNumber => "the only number is part of the series name",
+        };
+        return Some(Some(format!("{why} ({})", p.label)));
+    }
+    if let Some(sim) = e.misfiled {
+        return Some(Some(format!(
+            "filename looks like another series (similarity {sim:.2})"
+        )));
+    }
+    if e.locked() && !force {
+        return Some(Some(format!(
+            "number is locked at {}; pass force to overwrite",
+            e.book.metadata.number
+        )));
+    }
+    None
+}
+
+pub fn renumber_plan(data: &[LibraryData], force: bool) -> (Vec<Renumber>, Vec<Skipped>) {
+    let mut planned = Vec::new();
+    let mut skipped = Vec::new();
+    for lib in data {
+        for v in views(lib) {
+            for e in &v.entries {
+                match renumber_skip(e, force) {
+                    None => {
+                        let p = e.name.parsed.as_ref().expect("planned books parse");
+                        planned.push(Renumber {
+                            book_id: e.book.id.clone(),
+                            series_name: v.series.name.clone(),
+                            file: e.file().to_string(),
+                            current_number: e.book.metadata.number.clone(),
+                            current_sort: e.book.metadata.number_sort,
+                            number: p.label.clone(),
+                            number_sort: p.number,
+                        });
+                    }
+                    Some(Some(reason)) => skipped.push(Skipped {
+                        book_id: e.book.id.clone(),
+                        series_name: v.series.name.clone(),
+                        file: e.file().to_string(),
+                        reason,
+                    }),
+                    Some(None) => {}
+                }
+            }
+        }
+    }
+    (planned, skipped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +677,7 @@ mod tests {
         );
         let r = audit("k", &[data]);
         assert_eq!(r.summary.misnumbered_books, 4);
+        assert_eq!(r.summary.renumberable_books, 4);
         assert_eq!(r.summary.duplicate_numbers, 1);
         let s = &r.libraries[0].series[0];
         assert_eq!(s.duplicates[0].number, "7");
@@ -584,5 +686,60 @@ mod tests {
             vec![IssueRange { from: 1, to: 2 }, IssueRange { from: 5, to: 6 }]
         );
         assert_eq!(r.summary.missing_issues, 4);
+    }
+
+    #[test]
+    fn renumber_plans_only_wrong_unlocked_plain_issues() {
+        let mut locked = book("l", "S1", "Saga 05 (2012).cbz", 2.0, 1);
+        locked.metadata.number_lock = true;
+        let data = lib(
+            &[("S1", "Saga (2012)")],
+            vec![
+                book("ok", "S1", "Saga 01 (2012).cbz", 1.0, 1),
+                book("wrong", "S1", "Saga 18 (2012).cbz", 3.0, 1),
+                locked,
+                book("dec", "S1", "Saga 605.1 (2012).cbz", 4.0, 1),
+                book("suf", "S1", "Saga 065.Deaths (2012).cbz", 5.0, 1),
+                book("vol", "S1", "Saga v07 (2012).cbz", 6.0, 1),
+                book("none", "S1", "Saga (2012).cbz", 7.0, 1),
+                book("other", "S1", "Batman 004 (2016).cbz", 8.0, 1),
+            ],
+        );
+        let (planned, skipped) = renumber_plan(std::slice::from_ref(&data), false);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].book_id, "wrong");
+        assert_eq!(
+            (planned[0].number.as_str(), planned[0].number_sort),
+            ("18", 18.0)
+        );
+        let skipped: Vec<&str> = skipped.iter().map(|s| s.book_id.as_str()).collect();
+        assert_eq!(skipped, vec!["l", "dec", "suf", "none", "other"]);
+
+        let (planned, _) = renumber_plan(std::slice::from_ref(&data), true);
+        let ids: Vec<&str> = planned.iter().map(|p| p.book_id.as_str()).collect();
+        assert_eq!(ids, vec!["wrong", "l"]);
+    }
+
+    #[test]
+    fn renumber_is_idempotent_once_numbers_match() {
+        let mut b = book("a", "S1", "Saga 18 (2012).cbz", 18.0, 1);
+        b.metadata.number_lock = true;
+        b.metadata.number_sort_lock = true;
+        let (planned, skipped) = renumber_plan(&[lib(&[("S1", "Saga (2012)")], vec![b])], true);
+        assert!(planned.is_empty() && skipped.is_empty());
+    }
+
+    #[test]
+    fn number_string_mismatch_is_misnumbered() {
+        let mut b = book("a", "S1", "Saga 018 (2012).cbz", 18.0, 1);
+        b.metadata.number = "1".into();
+        let (planned, _) = renumber_plan(&[lib(&[("S1", "Saga (2012)")], vec![b])], false);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].number, "18");
+
+        let mut b = book("a", "S1", "Saga 018 (2012).cbz", 18.0, 1);
+        b.metadata.number = "018".into();
+        let (planned, _) = renumber_plan(&[lib(&[("S1", "Saga (2012)")], vec![b])], false);
+        assert!(planned.is_empty());
     }
 }

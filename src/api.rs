@@ -155,6 +155,15 @@ impl<T: HasId> Pager<T> {
     }
 }
 
+#[derive(Serialize)]
+#[serde(crate = "plugin_toolkit::serde", rename_all = "camelCase")]
+struct NumberPatch<'a> {
+    number: &'a str,
+    number_sort: f64,
+    number_lock: bool,
+    number_sort_lock: bool,
+}
+
 /// Komga ids are alphanumeric; anything else would reshape the request path.
 pub fn check_id(id: &str) -> Result<&str> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -238,6 +247,20 @@ impl Komga {
     pub async fn series_books(&self, series_id: &str) -> Result<Vec<Book>> {
         self.listing(&format!("series/{}/books", check_id(series_id)?))
             .await
+    }
+
+    /// Set number and sort number with both locks, so rescans keep them.
+    pub async fn set_number(&self, book_id: &str, number: &str, number_sort: f64) -> Result<()> {
+        let path = format!("books/{}/metadata", check_id(book_id)?);
+        let body = NumberPatch {
+            number,
+            number_sort,
+            number_lock: true,
+            number_sort_lock: true,
+        };
+        self.send(self.http.patch(self.url(&path)).json(&body), &path)
+            .await
+            .map(drop)
     }
 
     pub async fn scan(&self, library_id: &str, deep: bool) -> Result<()> {

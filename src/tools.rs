@@ -5,6 +5,7 @@
 //!
 //! Library upkeep:
 //!   - `komga.library.audit`   mis-numbered books, duplicates, misfiled/unparseable files, gaps
+//!   - `komga.books.renumber`  write filename issue numbers back, locked (dry run by default)
 //!   - `komga.library.scan`    trigger a library scan (dry run by default)
 //!
 //! Libraries default to the one named `comics`: the filename rules are comic
@@ -13,7 +14,7 @@
 use plugin_toolkit::prelude::*;
 
 use crate::api::{Komga, Library};
-use crate::audit::{self, AuditReport, LibraryData};
+use crate::audit::{self, AuditReport, LibraryData, Renumber, Skipped};
 use crate::execute;
 
 #[endpoint_resource(plugin = "komga")]
@@ -86,6 +87,19 @@ async fn collect(
     }
 }
 
+/// Mutating verbs act on an explicit scope; `all` means the comics libraries.
+fn require_scope(
+    tool: &str,
+    library_id: &Option<String>,
+    series_id: &Option<String>,
+    all: bool,
+) -> Result<()> {
+    if library_id.is_none() && series_id.is_none() && !all {
+        bail!("{tool}: pick a scope: library_id, series_id, or all");
+    }
+    Ok(())
+}
+
 #[orca_struct]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
@@ -121,6 +135,93 @@ async fn komga_library_audit(args: AuditArgs, _ctx: &ToolCtx) -> Result<AuditRep
     let k = connect(&args.name).await?;
     let data = collect(&k, args.library_id.as_deref(), args.series_id.as_deref()).await?;
     Ok(audit::audit(&args.name, &data))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// komga.books.renumber
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[orca_struct(args)]
+pub struct RenumberArgs {
+    /// Registered komga endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Komga library id.
+    #[arg(long)]
+    pub library_id: Option<String>,
+    /// Komga series id.
+    #[arg(long)]
+    pub series_id: Option<String>,
+    /// The library named `comics`.
+    #[arg(long)]
+    #[serde(default)]
+    pub all: bool,
+    /// Overwrite numbers that are already locked.
+    #[arg(long)]
+    #[serde(default)]
+    pub force: bool,
+    /// Apply. Omitted, returns the plan and changes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenumberReport {
+    pub name: String,
+    pub execute: bool,
+    /// Books whose number and sort number would be set (and locked).
+    pub planned: Vec<Renumber>,
+    /// Mis-numbered or unparseable books left alone, with the reason.
+    pub skipped: Vec<Skipped>,
+    /// Book ids updated (execute only).
+    pub applied: Vec<String>,
+    pub failed: Vec<Failure>,
+}
+
+/// **Fix issue numbering**: set each mis-numbered book's `number` and
+/// `numberSort` to the filename's issue number, with both locks so rescans
+/// keep them. Skips books already right, locked numbers (unless `force`),
+/// decimal and suffixed issues, volumes, unparseable files, and files that
+/// look like another series. Without `execute`, returns the plan.
+///
+/// `execute` applies the whole plan as computed when it runs, with no confirm
+/// list: every write is a locked metadata change, reversible by another write.
+#[orca_tool(
+    domain = "komga",
+    verb = "books.renumber",
+    role = "admin",
+    execute_gated = false
+)]
+async fn komga_books_renumber(args: RenumberArgs, ctx: &ToolCtx) -> Result<RenumberReport> {
+    const TOOL: &str = "komga.books.renumber";
+    execute::require_admin(TOOL, ctx)?;
+    require_scope(TOOL, &args.library_id, &args.series_id, args.all)?;
+    let k = connect(&args.name).await?;
+    let data = collect(&k, args.library_id.as_deref(), args.series_id.as_deref()).await?;
+    let (planned, skipped) = audit::renumber_plan(&data, args.force);
+    let mut applied = Vec::new();
+    let mut failed = Vec::new();
+    if args.execute {
+        for p in &planned {
+            match k.set_number(&p.book_id, &p.number, p.number_sort).await {
+                Ok(()) => applied.push(p.book_id.clone()),
+                Err(e) => failed.push(Failure {
+                    id: p.book_id.clone(),
+                    error: format!("{e:#}"),
+                }),
+            }
+        }
+    }
+    Ok(RenumberReport {
+        name: args.name,
+        execute: args.execute,
+        planned,
+        skipped,
+        applied,
+        failed,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -207,6 +308,14 @@ async fn komga_library_scan(args: ScanArgs, ctx: &ToolCtx) -> Result<ScanReport>
 mod tests {
     use super::*;
 
+    #[test]
+    fn mutations_need_an_explicit_scope() {
+        assert!(require_scope("t", &None, &None, false).is_err());
+        assert!(require_scope("t", &None, &None, true).is_ok());
+        assert!(require_scope("t", &Some("L".into()), &None, false).is_ok());
+        assert!(require_scope("t", &None, &Some("S".into()), false).is_ok());
+    }
+
     fn library(id: &str, empty_trash: bool) -> Library {
         Library {
             id: id.into(),
@@ -225,7 +334,11 @@ mod tests {
 
     #[test]
     fn library_tools_are_not_host_execute_gated() {
-        const OWN: [&str; 2] = ["komga.library.audit", "komga.library.scan"];
+        const OWN: [&str; 3] = [
+            "komga.library.audit",
+            "komga.books.renumber",
+            "komga.library.scan",
+        ];
         let gated: Vec<&str> = plugin_toolkit::dispatch::execute_gated_names()
             .into_iter()
             .filter(|n| OWN.contains(n))
@@ -233,6 +346,8 @@ mod tests {
         assert!(gated.is_empty(), "{gated:?}");
         let role = |n| plugin_toolkit::dispatch::required_role(n);
         assert_eq!(role("komga.library.audit"), Some("read"));
-        assert_eq!(role("komga.library.scan"), Some("admin"));
+        for n in ["komga.books.renumber", "komga.library.scan"] {
+            assert_eq!(role(n), Some("admin"), "{n}");
+        }
     }
 }

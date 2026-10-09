@@ -83,11 +83,19 @@ key sent as `X-API-Key`, held in the secrets domain as `komga.<name>.api_key`):
 
 ```sh
 orca komga.library.audit --name komga                        # read-only: numbering, duplicates, gaps
+orca komga.books.renumber --name komga --all                 # dry run: planned number fixes
+orca komga.books.renumber --name komga --series-id <id> --execute
 orca komga.library.scan --name komga --library-id <id> --deep --execute
 ```
 
 Komga numbers books by sort order, not by the number in the filename, so a
-series with gaps reads out of order.
+series with gaps reads out of order. `renumber` writes the filename's issue
+number to `number`/`numberSort` with both locks, which survive rescans. It
+skips locked numbers (unless `--force`), decimal (`605.1`) and suffixed
+(`065.Deaths`) issues, volumes (`v07`), files with no number, and files that
+look like another series.
+`--execute` applies the whole plan as computed when it runs, with no confirm
+list; each write is a locked metadata change another write can undo.
 
 Listings are read in one unpaged request and must match Komga's
 `totalElements` exactly, or the tool fails rather than plan on a partial list.
