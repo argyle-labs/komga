@@ -28,6 +28,15 @@ pub struct Series {
     pub library_id: String,
     /// Folder name; the title can differ when ComicInfo sets one.
     pub name: String,
+    #[serde(default)]
+    pub metadata: SeriesMetadata,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(crate = "plugin_toolkit::serde")]
+pub struct SeriesMetadata {
+    #[serde(default)]
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -409,6 +418,7 @@ mod tests {
                     id: (*id).into(),
                     library_id: "L".into(),
                     name: "s".into(),
+                    metadata: Default::default(),
                 })
                 .collect(),
             last,
@@ -450,6 +460,21 @@ mod tests {
         let mut p = Pager::new();
         p.push(page(&["a"], false, 2)).unwrap();
         assert!(p.push(page(&["b"], true, 3)).is_err());
+    }
+
+    #[test]
+    fn readlist_patch_omits_absent_summary() {
+        let ids = vec!["a".to_string()];
+        let body = |summary| {
+            serde_json::to_value(ReadListPatch {
+                ordered: true,
+                book_ids: &ids,
+                summary,
+            })
+            .unwrap()
+        };
+        assert_eq!(body(None), json!({"ordered": true, "bookIds": ["a"]}));
+        assert_eq!(body(Some("s"))["summary"], "s");
     }
 
     #[test]

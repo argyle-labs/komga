@@ -877,6 +877,7 @@ mod tests {
                     id: (*id).into(),
                     library_id: "L1".into(),
                     name: (*name).into(),
+                    metadata: Default::default(),
                 })
                 .collect(),
             books,

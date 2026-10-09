@@ -612,6 +612,11 @@ pub struct ReadlistSyncArgs {
     #[arg(long, value_delimiter = ',')]
     #[serde(default)]
     pub book_ids: Vec<String>,
+    /// The dry run's `diff.current`, in order (execute only; empty when it
+    /// planned a create). Comma-separated on the CLI.
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub expected_current: Vec<String>,
     /// Apply. Omitted, returns the plan and changes nothing.
     #[arg(long)]
     #[serde(default)]
@@ -641,7 +646,8 @@ pub struct ReadlistSyncReport {
 /// An entry matching several books is reported with every candidate and never
 /// guessed. Without `execute`, returns the resolved order, the unresolved
 /// entries, and the diff against the existing readlist. `execute` needs the
-/// dry run's `book_ids` unchanged and every entry resolved.
+/// dry run's `book_ids` and `diff.current` unchanged and every entry
+/// resolved.
 #[orca_tool(
     domain = "komga",
     verb = "readlist.sync",
@@ -654,8 +660,10 @@ async fn komga_readlist_sync(args: ReadlistSyncArgs, ctx: &ToolCtx) -> Result<Re
     if args.readlist.trim().is_empty() {
         bail!("{TOOL}: readlist name is empty");
     }
-    if !args.execute && !args.book_ids.is_empty() {
-        bail!("{TOOL}: `book_ids` only applies with execute; nothing was written");
+    if !args.execute && (!args.book_ids.is_empty() || !args.expected_current.is_empty()) {
+        bail!(
+            "{TOOL}: `book_ids` and `expected_current` only apply with execute; nothing was written"
+        );
     }
     let k = connect(&args.name).await?;
     let cat = readlist_catalog(&k, args.library_id.as_deref(), &args.entries).await?;
@@ -671,7 +679,10 @@ async fn komga_readlist_sync(args: ReadlistSyncArgs, ctx: &ToolCtx) -> Result<Re
             &diff,
             &book_ids,
             unresolved.len(),
-            &args.book_ids,
+            &Confirmed {
+                book_ids: &args.book_ids,
+                current: &args.expected_current,
+            },
         )
         .await?
     } else {
@@ -695,9 +706,12 @@ async fn readlist_catalog(
     entries: &[ReadlistEntry],
 ) -> Result<Catalog> {
     let mut series = Vec::new();
+    let mut names = Vec::new();
     for lib in libraries_in_scope(k, library_id).await? {
         series.extend(k.library_series(&lib.id).await?);
+        names.push(lib.name);
     }
+    let mut foreign = BTreeSet::new();
     let mut books = BTreeMap::new();
     let mut direct = BTreeMap::new();
     for e in entries {
@@ -711,14 +725,30 @@ async fn readlist_catalog(
             }
         }
         if let Some(key) = &e.series {
-            if let SeriesMatch::One(s) = readlist::find_series(&series, key) {
-                if !books.contains_key(&s.id) {
-                    books.insert(s.id.clone(), k.series_books(&s.id).await?);
+            match readlist::find_series(&series, key) {
+                SeriesMatch::One(s) => {
+                    if !books.contains_key(&s.id) {
+                        books.insert(s.id.clone(), k.series_books(&s.id).await?);
+                    }
                 }
+                // Only to word the miss: a key that is an id elsewhere is
+                // out of scope, not absent. Lookup errors mean "not an id".
+                SeriesMatch::None => {
+                    let key = key.trim();
+                    if check_id(key).is_ok()
+                        && !foreign.contains(key)
+                        && k.series(key).await.is_ok()
+                    {
+                        foreign.insert(key.to_string());
+                    }
+                }
+                SeriesMatch::Many(_) => {}
             }
         }
     }
     Ok(Catalog {
+        scope: names.join(", "),
+        foreign,
         series,
         books,
         direct,
@@ -780,9 +810,16 @@ impl ReadlistOps for Komga {
     }
 }
 
+/// What the operator saw in the dry run.
+struct Confirmed<'a> {
+    book_ids: &'a [String],
+    current: &'a [String],
+}
+
 /// Writes only a fully resolved plan the operator confirmed verbatim: a
 /// readlist is replaced whole, so a partial or reshuffled list would lose
-/// entries silently.
+/// entries silently, and a list edited since the dry run would lose those
+/// edits.
 async fn apply_readlist<O: ReadlistOps>(
     ops: &O,
     name: &str,
@@ -790,7 +827,7 @@ async fn apply_readlist<O: ReadlistOps>(
     diff: &ReadlistDiff,
     want: &[String],
     unresolved: usize,
-    confirmed: &[String],
+    confirmed: &Confirmed<'_>,
 ) -> Result<Option<String>> {
     const TOOL: &str = "komga.readlist.sync";
     if unresolved > 0 {
@@ -799,10 +836,24 @@ async fn apply_readlist<O: ReadlistOps>(
     if want.is_empty() {
         bail!("{TOOL}: no books to write");
     }
-    if confirmed != want {
+    if confirmed.book_ids != want {
         bail!(
             "{TOOL}: execute needs `book_ids` equal to the dry run's, in order; the plan differs"
         );
+    }
+    match diff.readlist_id {
+        None if !confirmed.current.is_empty() => bail!(
+            "{TOOL}: readlist '{name}' no longer exists; re-run the dry run; nothing was written"
+        ),
+        Some(_) if confirmed.current != diff.current.as_slice() => {
+            let what = if confirmed.current.is_empty() {
+                "now exists"
+            } else {
+                "changed since the dry run"
+            };
+            bail!("{TOOL}: readlist '{name}' {what}; re-run the dry run; nothing was written")
+        }
+        _ => {}
     }
     match (diff.action.as_str(), &diff.readlist_id) {
         ("none", id) => Ok(id.clone()),
@@ -1085,6 +1136,19 @@ mod tests {
             removed: Vec::new(),
             reordered: false,
             summary_changed: false,
+            ordered_changed: false,
+            current: if id.is_some() {
+                strs(&["a"])
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn ok<'a>(want: &'a [String], current: &'a [String]) -> Confirmed<'a> {
+        Confirmed {
+            book_ids: want,
+            current,
         }
     }
 
@@ -1092,22 +1156,25 @@ mod tests {
     async fn readlist_creates_or_updates_the_confirmed_order() {
         let m = Mock::default();
         let want = strs(&["b", "a"]);
-        let id = apply_readlist(&m, "SW", None, &plan("create", None), &want, 0, &want)
-            .await
-            .unwrap();
-        assert_eq!(id.as_deref(), Some("NEW"));
-        apply_readlist(
+        let cur = strs(&["a"]);
+        let id = apply_readlist(
             &m,
             "SW",
-            Some("s"),
-            &plan("update", Some("R")),
+            None,
+            &plan("create", None),
             &want,
             0,
-            &want,
+            &ok(&want, &[]),
         )
         .await
         .unwrap();
-        apply_readlist(&m, "SW", None, &plan("none", Some("R")), &want, 0, &want)
+        assert_eq!(id.as_deref(), Some("NEW"));
+        let p = plan("update", Some("R"));
+        apply_readlist(&m, "SW", Some("s"), &p, &want, 0, &ok(&want, &cur))
+            .await
+            .unwrap();
+        let p = plan("none", Some("R"));
+        apply_readlist(&m, "SW", None, &p, &want, 0, &ok(&want, &cur))
             .await
             .unwrap();
         assert_eq!(
@@ -1120,20 +1187,45 @@ mod tests {
     async fn readlist_refuses_unresolved_or_unconfirmed_plans() {
         let m = Mock::default();
         let want = strs(&["a", "b"]);
+        let cur = strs(&["a"]);
         let p = plan("update", Some("R"));
-        assert!(apply_readlist(&m, "SW", None, &p, &want, 1, &want)
-            .await
-            .is_err());
-        assert!(apply_readlist(&m, "SW", None, &p, &want, 0, &[])
+        assert!(
+            apply_readlist(&m, "SW", None, &p, &want, 1, &ok(&want, &cur))
+                .await
+                .is_err()
+        );
+        assert!(apply_readlist(&m, "SW", None, &p, &want, 0, &ok(&[], &cur))
             .await
             .is_err());
         let reversed = strs(&["b", "a"]);
-        assert!(apply_readlist(&m, "SW", None, &p, &want, 0, &reversed)
+        assert!(
+            apply_readlist(&m, "SW", None, &p, &want, 0, &ok(&reversed, &cur))
+                .await
+                .is_err()
+        );
+        assert!(apply_readlist(&m, "SW", None, &p, &[], 0, &ok(&[], &cur))
             .await
             .is_err());
-        assert!(apply_readlist(&m, "SW", None, &p, &[], 0, &[])
-            .await
-            .is_err());
+        assert!(m.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn readlist_refuses_a_list_changed_since_the_dry_run() {
+        let m = Mock::default();
+        let want = strs(&["a", "b"]);
+        let err = |r: Result<Option<String>>| r.unwrap_err().to_string();
+        // Dry run planned a create; a list with that name appeared since.
+        let p = plan("update", Some("R"));
+        let e = err(apply_readlist(&m, "SW", None, &p, &want, 0, &ok(&want, &[])).await);
+        assert!(e.contains("now exists"), "{e}");
+        // Live books differ from the ones the dry run saw.
+        let seen = strs(&["z"]);
+        let e = err(apply_readlist(&m, "SW", None, &p, &want, 0, &ok(&want, &seen)).await);
+        assert!(e.contains("changed since the dry run"), "{e}");
+        // Dry run saw a list; it is gone now.
+        let p = plan("create", None);
+        let e = err(apply_readlist(&m, "SW", None, &p, &want, 0, &ok(&want, &seen)).await);
+        assert!(e.contains("no longer exists"), "{e}");
         assert!(m.calls.lock().unwrap().is_empty());
     }
 

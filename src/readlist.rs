@@ -92,11 +92,20 @@ pub struct ReadlistDiff {
     /// Books kept in both lists but in a different relative order.
     pub reordered: bool,
     pub summary_changed: bool,
+    /// The existing readlist is unordered; the write sets it ordered.
+    pub ordered_changed: bool,
+    /// The existing readlist's books as seen by this plan; pass them as
+    /// `expected_current` to execute.
+    pub current: Vec<String>,
 }
 
 /// Fetched inputs: series in scope, books per needed series id, and books
-/// looked up directly by id (`Err` text when the lookup failed).
+/// looked up directly by id (`Err` text when the lookup failed). `scope`
+/// names the libraries searched; `foreign` holds series keys that are ids of
+/// series outside them.
 pub struct Catalog {
+    pub scope: String,
+    pub foreign: BTreeSet<String>,
     pub series: Vec<Series>,
     pub books: BTreeMap<String, Vec<Book>>,
     pub direct: BTreeMap<String, std::result::Result<Book, String>>,
@@ -108,7 +117,8 @@ pub enum SeriesMatch<'a> {
     Many(Vec<&'a Series>),
 }
 
-/// Exact id, else exact name (case-insensitive). A near match is not a match.
+/// Exact id, else exact folder name or metadata title (case-insensitive).
+/// A near match is not a match.
 pub fn find_series<'a>(series: &'a [Series], key: &str) -> SeriesMatch<'a> {
     let key = key.trim();
     if let Some(s) = series.iter().find(|s| s.id == key) {
@@ -116,7 +126,10 @@ pub fn find_series<'a>(series: &'a [Series], key: &str) -> SeriesMatch<'a> {
     }
     let named: Vec<&Series> = series
         .iter()
-        .filter(|s| s.name.trim().eq_ignore_ascii_case(key))
+        .filter(|s| {
+            s.name.trim().eq_ignore_ascii_case(key)
+                || s.metadata.title.trim().eq_ignore_ascii_case(key)
+        })
         .collect();
     match named.len() {
         0 => SeriesMatch::None,
@@ -125,11 +138,23 @@ pub fn find_series<'a>(series: &'a [Series], key: &str) -> SeriesMatch<'a> {
     }
 }
 
+/// Digits with an optional decimal part; `f64` parsing alone would also
+/// accept `nan`, `inf`, and `1e2`.
+fn numeric(s: &str) -> Option<f64> {
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let ok = match s.split_once('.') {
+        Some((int, frac)) => digits(int) && digits(frac),
+        None => digits(s),
+    };
+    ok.then(|| s.parse().ok()).flatten()
+}
+
 /// `"001"` and `"1.0"` equal `"1"`; non-numeric issues compare as text.
 fn same_number(a: &str, b: &str) -> bool {
-    match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-        (Ok(x), Ok(y)) => parse::canonical(x) == parse::canonical(y),
-        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    let (a, b) = (a.trim(), b.trim());
+    match (numeric(a), numeric(b)) {
+        (Some(x), Some(y)) => parse::canonical(x) == parse::canonical(y),
+        _ => a.eq_ignore_ascii_case(b),
     }
 }
 
@@ -195,41 +220,61 @@ fn resolve_one(
     let none = |e: String| (e, Vec::new());
     match (&entry.book, &entry.series, &entry.number) {
         (Some(id), None, None) => match cat.direct.get(id.as_str()) {
-            Some(Ok(b)) if !b.deleted => Ok(book_ref(series_name(&cat.series, &b.series_id), b)),
-            Some(Ok(_)) => Err(none("book is deleted".into())),
+            Some(Ok(b)) if b.available() => Ok(book_ref(series_name(&cat.series, &b.series_id), b)),
+            Some(Ok(b)) => Err(none(unavailable(b))),
             Some(Err(e)) => Err(none(e.clone())),
             None => Err(none("book was not looked up".into())),
         },
         (None, Some(key), Some(number)) => {
             let s = match find_series(&cat.series, key) {
                 SeriesMatch::One(s) => s,
-                SeriesMatch::None => return Err(none(format!("no series named '{key}'"))),
+                SeriesMatch::None if cat.foreign.contains(key.trim()) => {
+                    return Err(none(format!(
+                        "series '{key}' isn't in library '{}'",
+                        cat.scope
+                    )))
+                }
+                SeriesMatch::None => {
+                    return Err(none(format!(
+                        "no series named '{key}' in library '{}'",
+                        cat.scope
+                    )))
+                }
                 SeriesMatch::Many(m) => {
                     let ids: Vec<String> = m.iter().map(|s| s.id.clone()).collect();
                     return Err(none(format!(
-                        "ambiguous: {} series named '{key}': {}",
+                        "ambiguous: {} series named or titled '{key}': {}",
                         m.len(),
                         ids.join(", ")
                     )));
                 }
             };
-            let hits: Vec<BookRef> = cat
+            let hits: Vec<&Book> = cat
                 .books
                 .get(&s.id)
                 .into_iter()
                 .flatten()
                 .filter(|b| !b.deleted && same_number(&b.metadata.number, number))
-                .map(|b| book_ref(&s.name, b))
                 .collect();
-            if hits.len() > 1 {
-                let msg = format!("ambiguous: {} books are {} #{number}", hits.len(), s.name);
-                return Err((msg, hits));
+            match hits.as_slice() {
+                [] => Err(none(format!("{} has no #{number}", s.name))),
+                [b] if b.available() => Ok(book_ref(&s.name, b)),
+                [b] => Err(none(unavailable(b))),
+                many => Err((
+                    format!("ambiguous: {} books are {} #{number}", many.len(), s.name),
+                    many.iter().map(|b| book_ref(&s.name, b)).collect(),
+                )),
             }
-            hits.into_iter()
-                .next()
-                .ok_or_else(|| none(format!("{} has no #{number}", s.name)))
         }
         _ => Err(none("an entry is either {series, number} or {book}".into())),
+    }
+}
+
+fn unavailable(b: &Book) -> String {
+    if b.deleted {
+        "book is deleted".into()
+    } else {
+        format!("book is unavailable (media {})", b.media_status())
     }
 }
 
@@ -242,6 +287,8 @@ pub fn diff(existing: Option<&ReadList>, want: &[String], summary: Option<&str>)
             removed: Vec::new(),
             reordered: false,
             summary_changed: summary.is_some_and(|s| !s.is_empty()),
+            ordered_changed: false,
+            current: Vec::new(),
         };
     };
     let have: BTreeSet<&str> = rl.book_ids.iter().map(String::as_str).collect();
@@ -268,7 +315,9 @@ pub fn diff(existing: Option<&ReadList>, want: &[String], summary: Option<&str>)
         .collect();
     let reordered = kept_old != kept_new;
     let summary_changed = summary.is_some_and(|s| s != rl.summary);
-    let changed = !added.is_empty() || !removed.is_empty() || reordered || summary_changed;
+    let ordered_changed = !rl.ordered;
+    let changed =
+        !added.is_empty() || !removed.is_empty() || reordered || summary_changed || ordered_changed;
     ReadlistDiff {
         action: if changed { "update" } else { "none" }.into(),
         readlist_id: Some(rl.id.clone()),
@@ -276,6 +325,8 @@ pub fn diff(existing: Option<&ReadList>, want: &[String], summary: Option<&str>)
         removed,
         reordered,
         summary_changed,
+        ordered_changed,
+        current: rl.book_ids.clone(),
     }
 }
 
@@ -289,6 +340,7 @@ mod tests {
             id: id.into(),
             library_id: "L".into(),
             name: name.into(),
+            metadata: Default::default(),
         }
     }
 
@@ -330,12 +382,27 @@ mod tests {
     fn catalog() -> Catalog {
         let mut gone = book("gone", "A", "3");
         gone.deleted = true;
+        let mut titled = series("E", "Folder E");
+        titled.metadata.title = "Titled".into();
+        let mut broken = book("b2", "B", "2");
+        broken.media = Some(Media {
+            status: "ERROR".into(),
+        });
+        let mut unsupported = book("bu", "B", "9");
+        unsupported.media = Some(Media {
+            status: "UNSUPPORTED".into(),
+        });
         Catalog {
+            scope: "comics".into(),
+            foreign: BTreeSet::from(["X9".to_string()]),
             series: vec![
                 series("A", "Secret Wars (2015)"),
                 series("B", "Secret Wars (1984)"),
                 series("C", "Dup"),
                 series("D", "Dup"),
+                titled,
+                series("F", "Titled"),
+                series("G", "A"),
             ],
             books: BTreeMap::from([
                 (
@@ -347,10 +414,14 @@ mod tests {
                         gone,
                     ],
                 ),
-                ("B".into(), vec![book("b1", "B", "1")]),
+                (
+                    "B".into(),
+                    vec![book("b1", "B", "1"), broken, book("ann", "B", "Annual 1")],
+                ),
             ]),
             direct: BTreeMap::from([
                 ("b1".into(), Ok(book("b1", "B", "1"))),
+                ("bu".into(), Ok(unsupported)),
                 ("zz".into(), Err("komga books/zz: http 404".into())),
             ]),
         }
@@ -407,6 +478,50 @@ mod tests {
     }
 
     #[test]
+    fn series_id_beats_a_series_named_that_id() {
+        assert!(matches!(find_series(&catalog().series, "A"), SeriesMatch::One(s) if s.id == "A"));
+    }
+
+    #[test]
+    fn title_and_folder_name_both_match() {
+        let cat = catalog();
+        assert!(matches!(find_series(&cat.series, "folder e"), SeriesMatch::One(s) if s.id == "E"));
+        let (_, bad) = resolve(&[sn("titled", "1")], &cat);
+        assert!(bad[0].error.contains("E, F"), "{}", bad[0].error);
+    }
+
+    #[test]
+    fn numbers_are_digits_or_exact_text() {
+        assert!(same_number("001", "1.0"));
+        assert!(same_number("Annual 1", "annual 1"));
+        assert!(!same_number("Annual 1", "1"));
+        for odd in ["nan", "inf", "1e2", "1.", ".5", "-1"] {
+            assert_eq!(numeric(odd), None, "{odd}");
+        }
+        assert!(!same_number("1e2", "100"));
+        let (ok, _) = resolve(&[sn("B", "annual 1")], &catalog());
+        assert_eq!(ok[0].book.book_id, "ann");
+    }
+
+    #[test]
+    fn unavailable_books_are_unresolved() {
+        let (ok, bad) = resolve(&[sn("B", "2"), by_id("bu")], &catalog());
+        assert!(ok.is_empty());
+        assert!(bad[0].error.contains("media ERROR"), "{}", bad[0].error);
+        assert!(
+            bad[1].error.contains("media UNSUPPORTED"),
+            "{}",
+            bad[1].error
+        );
+    }
+
+    #[test]
+    fn series_outside_the_library_says_so() {
+        let (_, bad) = resolve(&[sn("X9", "1")], &catalog());
+        assert_eq!(bad[0].error, "series 'X9' isn't in library 'comics'");
+    }
+
+    #[test]
     fn parses_cli_entries() {
         assert_eq!(
             parse_entry("Secret Wars (2015) #3").unwrap(),
@@ -450,5 +565,15 @@ mod tests {
         let d = diff(Some(&old), &strs(&["a", "b", "c"]), None);
         assert_eq!(d.action, "none");
         assert!(diff(Some(&old), &strs(&["a", "b", "c"]), Some("t")).summary_changed);
+        assert_eq!(d.current, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn unordered_readlist_is_a_change() {
+        let mut old = rl(&["a"], "");
+        old.ordered = false;
+        let d = diff(Some(&old), &strs(&["a"]), None);
+        assert_eq!(d.action, "update");
+        assert!(d.ordered_changed);
     }
 }
