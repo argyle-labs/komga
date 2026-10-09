@@ -1,7 +1,8 @@
 # komga — ServiceBackend contract
 
-Pure-Rust plugin (**no bash/compose/provision scripts**) driven by the single
-generic `service.*` surface — no per-plugin tools. Runtimes: **docker,podman,lxc,vm**.
+Pure-Rust plugin (**no bash/compose/provision scripts**) driven by the generic
+`service.*` surface, plus the `komga.` library tools (audit, scan). Runtimes:
+**docker,podman,lxc,vm**.
 
 ## Per-plugin code (the only work this repo owns)
 - [x] `provider` / `runtimes` / `default_port` / `capabilities` / `data_paths` — declarative descriptor
