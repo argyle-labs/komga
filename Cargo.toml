@@ -16,14 +16,15 @@ crate-type = ["rlib"]
 name = "komga"
 path = "src/main.rs"
 
-# komga is a BACKEND-ONLY orca plugin: zero #[orca_tool]s. It registers a
-# ServiceBackend over the orca socket and reaches the whole orca system
-# through plugin-toolkit alone.
+# komga registers a ServiceBackend plus its `komga.` endpoint and library
+# tools over the orca socket, reaching orca through plugin-toolkit alone.
+# `delegated-http` sends every Komga request through orca's `http.request`
+# capability, so no reqwest/rustls is linked; `tools` + `db` carry the
+# `#[orca_tool]` and `#[endpoint_resource]` surface.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", default-features = false, features = ["tools", "db", "delegated-http"] }
 
 [dev-dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 tokio    = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 
