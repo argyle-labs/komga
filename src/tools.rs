@@ -9,6 +9,8 @@
 //!   - `komga.books.dedupe`    delete duplicate (and optionally generic) files (dry run by default)
 //!   - `komga.library.scan`    trigger a library scan (dry run by default)
 //!   - `komga.readlist.sync`   create or rewrite an ordered readlist (dry run by default)
+//!   - `komga.series.metadata` read a series' metadata and locked fields
+//!   - `komga.series.metadata_set` set series metadata fields, locked (dry run by default)
 //!
 //! Libraries default to the one named `comics`: the filename rules are comic
 //! conventions and would misread manga chapters.
@@ -25,6 +27,7 @@ use crate::execute;
 use crate::readlist::{
     self, Catalog, ReadlistDiff, ReadlistEntry, ResolvedEntry, SeriesMatch, UnresolvedEntry,
 };
+use crate::series_meta::{self, SeriesMetadataView, Wanted};
 
 #[endpoint_resource(plugin = "komga")]
 pub struct KomgaEndpoint {
@@ -879,6 +882,126 @@ async fn apply_readlist<O: ReadlistOps>(
             .map(|()| Some(id.clone())),
         (action, _) => bail!("{TOOL}: unexpected plan action '{action}'"),
     }
+}
+
+#[orca_struct(args)]
+pub struct SeriesMetadataArgs {
+    /// Registered komga endpoint name.
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub series_id: String,
+}
+
+/// Read a series' metadata and which fields are locked against rescans.
+#[orca_tool(domain = "komga", verb = "series.metadata", role = "read")]
+async fn komga_series_metadata(
+    args: SeriesMetadataArgs,
+    _ctx: &ToolCtx,
+) -> Result<SeriesMetadataView> {
+    let k = connect(&args.name).await?;
+    Ok((&k.series_metadata(&args.series_id).await?).into())
+}
+
+#[orca_struct(args)]
+pub struct SeriesMetadataSetArgs {
+    /// Registered komga endpoint name.
+    #[arg(long)]
+    pub name: String,
+    #[arg(long)]
+    pub series_id: String,
+    #[arg(long)]
+    pub title: Option<String>,
+    #[arg(long)]
+    pub title_sort: Option<String>,
+    /// `ENDED`, `ONGOING`, `ABANDONED` or `HIATUS`.
+    #[arg(long)]
+    pub status: Option<String>,
+    #[arg(long)]
+    pub summary: Option<String>,
+    #[arg(long)]
+    pub publisher: Option<String>,
+    /// `LEFT_TO_RIGHT`, `RIGHT_TO_LEFT`, `VERTICAL` or `WEBTOON`.
+    #[arg(long)]
+    pub reading_direction: Option<String>,
+    #[arg(long)]
+    pub language: Option<String>,
+    #[arg(long)]
+    pub age_rating: Option<i32>,
+    #[arg(long)]
+    pub total_book_count: Option<i32>,
+    /// Replaces the whole genre list (repeatable).
+    #[arg(long = "genre")]
+    pub genres: Option<Vec<String>>,
+    /// Replaces the whole tag list (repeatable).
+    #[arg(long = "tag")]
+    pub tags: Option<Vec<String>>,
+    /// Apply. Omitted, reports the changes and writes nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub execute: bool,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesMetadataSetReport {
+    pub series_id: String,
+    pub execute: bool,
+    pub changes: Vec<String>,
+    pub metadata: SeriesMetadataView,
+}
+
+/// **Set series metadata.** Sends only the given fields that differ, each
+/// locked so a rescan keeps it, then reads back and fails unless every change
+/// took. Without `execute`, reports the changes and writes nothing.
+#[orca_tool(
+    domain = "komga",
+    verb = "series.metadata_set",
+    role = "admin",
+    execute_gated = false
+)]
+async fn komga_series_metadata_set(
+    args: SeriesMetadataSetArgs,
+    ctx: &ToolCtx,
+) -> Result<SeriesMetadataSetReport> {
+    const TOOL: &str = "komga.series.metadata_set";
+    execute::require_admin(TOOL, ctx)?;
+    let want = Wanted {
+        title: args.title,
+        title_sort: args.title_sort,
+        status: args.status,
+        summary: args.summary,
+        publisher: args.publisher,
+        reading_direction: args.reading_direction,
+        language: args.language,
+        age_rating: args.age_rating,
+        total_book_count: args.total_book_count,
+        genres: args.genres,
+        tags: args.tags,
+    };
+    let k = connect(&args.name).await?;
+    let current: SeriesMetadataView = (&k.series_metadata(&args.series_id).await?).into();
+    let (body, changes) = series_meta::plan(&current, &want)?;
+    if !args.execute || changes.is_empty() {
+        return Ok(SeriesMetadataSetReport {
+            series_id: args.series_id,
+            execute: args.execute,
+            changes,
+            metadata: current,
+        });
+    }
+    k.update_series_metadata(&args.series_id, &body).await?;
+    let after: SeriesMetadataView = (&k.series_metadata(&args.series_id).await?).into();
+    let (_, left) = series_meta::plan(&after, &want)?;
+    if !left.is_empty() {
+        bail!("{TOOL}: komga did not take: {}", left.join("; "));
+    }
+    Ok(SeriesMetadataSetReport {
+        series_id: args.series_id,
+        execute: true,
+        changes,
+        metadata: after,
+    })
 }
 
 #[cfg(test)]

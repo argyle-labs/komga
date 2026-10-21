@@ -507,6 +507,20 @@ impl Komga {
         done(&what, self.api.update_book_metadata(book_id, &body).await)
     }
 
+    pub async fn series_metadata(&self, id: &str) -> Result<types::SeriesMetadataDto> {
+        let what = format!("series/{}", check_id(id)?);
+        value(&what, self.api.get_series_by_id(id).await).map(|s| s.metadata)
+    }
+
+    pub async fn update_series_metadata(
+        &self,
+        id: &str,
+        body: &types::SeriesMetadataUpdateDto,
+    ) -> Result<()> {
+        let what = format!("series/{}/metadata", check_id(id)?);
+        done(&what, self.api.update_series_metadata(id, body).await)
+    }
+
     /// Delete the book's file from disk through Komga, which drops the book.
     pub async fn delete_book_file(&self, book_id: &str) -> Result<()> {
         let what = format!("books/{}/file", check_id(book_id)?);
