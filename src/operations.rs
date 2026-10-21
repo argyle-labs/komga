@@ -13,6 +13,7 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("get", "/api/v1/series"),
     ("get", "/api/v1/series/{seriesId}"),
     ("get", "/api/v1/series/{seriesId}/books"),
+    ("patch", "/api/v1/series/{seriesId}/metadata"),
     ("get", "/api/v1/books"),
     ("get", "/api/v1/books/{bookId}"),
     ("patch", "/api/v1/books/{bookId}/metadata"),

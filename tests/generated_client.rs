@@ -60,6 +60,7 @@ fn generated_methods_exist() {
         get_series_deprecated,
         get_series_by_id,
         get_books_by_series_id,
+        update_series_metadata,
         get_all_books_deprecated,
         get_book_by_id,
         update_book_metadata,
@@ -71,4 +72,5 @@ fn generated_methods_exist() {
     assert_eq!(count, OPERATIONS.len());
     let _: Option<types::BookMetadataUpdateDto> = None;
     let _: Option<types::ReadListUpdateDto> = None;
+    let _: Option<types::SeriesMetadataUpdateDto> = None;
 }
