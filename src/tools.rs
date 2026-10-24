@@ -42,14 +42,9 @@ pub struct KomgaEndpoint {
 
 pub async fn connect(name: &str) -> Result<Komga> {
     let row = endpoint_db::require(name)?;
-    let api_key = plugin_toolkit::secrets::resolve_scoped(
-        "komga",
-        name,
-        "api_key",
-        (!row.api_key.is_empty()).then_some(row.api_key.as_str()),
-    )?;
+    let api_key = plugin_toolkit::secrets::resolve_scoped("komga", name, "api_key")?;
     let base_url = route::resolve_reachable(name, &row.routes, row.insecure).await?;
-    Komga::new(&base_url, &api_key, row.insecure)
+    Komga::new(&base_url, api_key.expose_secret(), row.insecure)
 }
 
 /// Auto-selected only when named exactly `comics`/`comic`, so a mixed
